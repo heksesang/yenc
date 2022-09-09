@@ -36,7 +36,7 @@ mod decode;
 mod encode;
 mod errors;
 
-pub use self::decode::{decode_buffer, DecodeOptions};
+pub use self::decode::{decode_buffer, DecodeOptions, MetaData};
 pub use self::encode::{encode_buffer, EncodeOptions};
 pub use self::errors::{DecodeError, EncodeError};
 
