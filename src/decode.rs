@@ -167,6 +167,21 @@ where
 
         match begin_line {
             Keywords {
+                begin: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                end: Some(keyword), ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                crc32: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                pcrc32: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
                 name: Some(Keyword { value: name, .. }),
                 size: Some(Keyword { value: size, .. }),
                 line_length: Some(_),
@@ -174,8 +189,12 @@ where
                 total: Some(Keyword { value: total, .. }),
                 ..
             } => {
+                let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
+                rdr.read_until(LF, &mut line_buf)?;
+
                 if line_buf.starts_with(b"=ypart ") {
                     let part_line = parse_keywords(&line_buf)?;
+
                     match part_line {
                         Keywords {
                             begin: Some(Keyword { value: begin, .. }),
@@ -202,6 +221,14 @@ where
                 }
             }
             Keywords {
+                part: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                total: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
                 name: Some(Keyword { value: name, .. }),
                 size: Some(Keyword { value: size, .. }),
                 line_length: Some(_),
@@ -220,6 +247,7 @@ where
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Header {
     Single {
         name: String,
@@ -279,46 +307,73 @@ where
                     name,
                     size: expected_size,
                     ..
-                } => match end_line {
-                    Keywords {
-                        size: Some(size),
-                        crc32,
-                        ..
-                    } => {
-                        size.expect(expected_size)?;
+                } => {
+                    return match end_line {
+                        Keywords {
+                            name: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            line_length: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            part: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            total: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            pcrc32: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            begin: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            end: Some(keyword), ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            size: Some(size),
+                            crc32,
+                            ..
+                        } => {
+                            size.expect(expected_size)?;
 
-                        if expected_size != actual_size {
-                            return Err(DecodeError::IncompleteData {
-                                expected_size,
-                                actual_size,
-                            });
-                        }
-
-                        return if let Some(Keyword { value, .. }) = crc32 {
-                            if value != checksum.finalize() {
-                                Err(DecodeError::InvalidChecksum)
-                            } else {
-                                Ok(MetaData::Single {
-                                    name,
-                                    size: expected_size,
-                                    crc32: Some(value),
+                            if expected_size != actual_size {
+                                Err(DecodeError::IncompleteData {
+                                    expected_size,
+                                    actual_size,
                                 })
+                            } else {
+                                if let Some(Keyword { value, .. }) = crc32 {
+                                    if value != checksum.finalize() {
+                                        Err(DecodeError::InvalidChecksum)
+                                    } else {
+                                        Ok(MetaData::Single {
+                                            name,
+                                            size: expected_size,
+                                            crc32: Some(value),
+                                        })
+                                    }
+                                } else {
+                                    Ok(MetaData::Single {
+                                        name,
+                                        size: expected_size,
+                                        crc32: None,
+                                    })
+                                }
                             }
-                        } else {
-                            Ok(MetaData::Single {
-                                name,
-                                size: expected_size,
-                                crc32: None,
-                            })
-                        };
-                    }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
+                        }
+                        _ => Err(DecodeError::InvalidHeader {
                             line: buf_to_string(&line_buf),
                             position: line_buf.len(),
-                        })
+                        }),
                     }
-                },
+                }
 
                 Header::Multi {
                     name,
@@ -329,7 +384,22 @@ where
                     size: total_size,
                     ..
                 } => {
-                    match end_line {
+                    return match end_line {
+                        Keywords {
+                            name: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            line_length: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            begin: Some(keyword),
+                            ..
+                        } => Err(keyword.unexpected()),
+                        Keywords {
+                            end: Some(keyword), ..
+                        } => Err(keyword.unexpected()),
                         Keywords {
                             size: Some(size),
                             pcrc32: Some(Keyword { value: pcrc32, .. }),
@@ -362,7 +432,7 @@ where
                                 Ok(MetaData::Multi {
                                     name,
                                     size: total_size,
-                                    crc32: crc32.map(|k| k.value),
+                                    crc32: crc32.map(Keyword::value),
                                     total,
                                     part,
                                     begin,
@@ -371,13 +441,11 @@ where
                                 })
                             };
                         }
-                        _ => {
-                            return Err(DecodeError::InvalidHeader {
-                                line: buf_to_string(&line_buf),
-                                position: line_buf.len(),
-                            })
-                        }
-                    }
+                        _ => Err(DecodeError::InvalidHeader {
+                            line: buf_to_string(&line_buf),
+                            position: line_buf.len(),
+                        }),
+                    };
                 }
             }
         } else {
@@ -847,11 +915,14 @@ struct Keyword<'a, T> {
 }
 
 impl<T> Keyword<'_, T> {
-    fn unexpected_value(&self) -> Result<T, DecodeError> {
-        Err(DecodeError::InvalidHeader {
+    fn value(self) -> T {
+        self.value
+    }
+    fn unexpected(&self) -> DecodeError {
+        DecodeError::InvalidHeader {
             line: buf_to_string(self.line_buf),
-            position: self.value_start,
-        })
+            position: self.keyword_start,
+        }
     }
 
     fn expect(&self, expected_value: T) -> Result<T, DecodeError>
@@ -863,6 +934,13 @@ impl<T> Keyword<'_, T> {
         } else {
             Ok(expected_value)
         }
+    }
+
+    fn unexpected_value(&self) -> Result<T, DecodeError> {
+        Err(DecodeError::InvalidHeader {
+            line: buf_to_string(self.line_buf),
+            position: self.value_start,
+        })
     }
 }
 
@@ -902,9 +980,85 @@ fn is_known_keyword(keyword_slice: &[u8]) -> bool {
 #[cfg(test)]
 #[allow(clippy::unreadable_literal)]
 mod tests {
-    use crate::decode::Keyword;
+    use std::io::BufReader;
 
-    use super::{decode_buffer, parse_keywords};
+    use crate::decode::{Header, Keyword};
+
+    use super::{decode_buffer, parse_keywords, read_header};
+
+    #[test]
+    fn read_single_part_header_begin_line_missing_keyword() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 name=CatOnKeyboardInSpace001.jpg\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_single_part_header_begin_line_unexpected_keyword() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 begin=1 name=CatOnKeyboardInSpace001.jpg\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_valid_single_part_header() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 name=CatOnKeyboardInSpace001.jpg\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_ok());
+        let header = read_result.unwrap();
+        assert_eq!(
+            Header::Single {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624
+            },
+            header
+        );
+    }
+
+    #[test]
+    fn read_multi_part_header_begin_line_missing_keyword() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 part=1 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_multi_part_header_part_line_missing_keyword() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_valid_multi_part_header() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_ok());
+        let header = read_result.unwrap();
+        assert_eq!(
+            Header::Multi {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624,
+                part: 1,
+                total: 27,
+                begin: 0,
+                end: 1024,
+            },
+            header
+        );
+    }
 
     #[test]
     fn parse_valid_footer_end_nl() {
