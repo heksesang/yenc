@@ -13,7 +13,7 @@ pub struct DecodeOptions<P> {
 }
 
 /// Metadata contained in the header lines.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MetaData {
     /// Describes a single-part binary.
     Single {
@@ -951,6 +951,7 @@ impl<T> Keyword<'_, T> {
     fn value(self) -> T {
         self.value
     }
+
     fn unexpected(&self) -> DecodeError {
         DecodeError::InvalidHeader {
             line: buf_to_string(self.line_buf),
@@ -1015,12 +1016,53 @@ fn is_known_keyword(keyword_slice: &[u8]) -> bool {
 mod tests {
     use std::io::BufReader;
 
-    use crate::decode::{Header, Keyword};
+    use crate::{
+        decode::{Header, Keyword},
+        MetaData,
+    };
 
-    use super::{decode_buffer, parse_keywords, read_header};
+    use super::{decode_buffer, parse_keywords, read_footer, read_header};
 
     #[test]
-    fn read_single_part_header_begin_line_missing_keyword() {
+    fn read_valid_single_part_footer() {
+        let header = Header::Single {
+            name: "CatOnKeyboardInSpace001.jpg".to_string(),
+            size: 26624,
+        };
+        let read_result = read_footer(header, b"=yend size=26624 crc32=ff00ff00\n");
+        assert!(read_result.is_ok());
+        let metadata = read_result.unwrap();
+        assert_eq!(
+            MetaData::Single {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624,
+                crc32: Some(0xff00ff00),
+            },
+            metadata
+        );
+    }
+
+    #[test]
+    fn read_valid_single_part_footer_without_crc32() {
+        let header = Header::Single {
+            name: "CatOnKeyboardInSpace001.jpg".to_string(),
+            size: 26624,
+        };
+        let read_result = read_footer(header, b"=yend size=26624\n");
+        assert!(read_result.is_ok());
+        let metadata = read_result.unwrap();
+        assert_eq!(
+            MetaData::Single {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624,
+                crc32: None,
+            },
+            metadata
+        );
+    }
+
+    #[test]
+    fn read_single_part_header_missing_line_length() {
         let mut rdr = BufReader::new(std::io::Cursor::new(
             b"=ybegin size=26624 name=CatOnKeyboardInSpace001.jpg\n",
         ));
@@ -1029,10 +1071,17 @@ mod tests {
     }
 
     #[test]
-    fn read_single_part_header_begin_line_unexpected_keyword() {
+    fn read_single_part_header_missing_size() {
         let mut rdr = BufReader::new(std::io::Cursor::new(
-            b"=ybegin size=26624 line=128 begin=1 name=CatOnKeyboardInSpace001.jpg\n",
+            b"=ybegin line=128 name=CatOnKeyboardInSpace001.jpg\n",
         ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_single_part_header_missing_name() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(b"=ybegin size=26624 line=128\n"));
         let read_result = read_header(&mut rdr);
         assert!(read_result.is_err());
     }
@@ -1055,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn read_multi_part_header_begin_line_missing_keyword() {
+    fn read_multi_part_header_missing_total() {
         let mut rdr = BufReader::new(std::io::Cursor::new(
             b"=ybegin size=26624 line=128 part=1 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
         ));
@@ -1064,7 +1113,25 @@ mod tests {
     }
 
     #[test]
-    fn read_multi_part_header_part_line_missing_keyword() {
+    fn read_multi_part_header_missing_part() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_multi_part_header_missing_begin() {
+        let mut rdr = BufReader::new(std::io::Cursor::new(
+            b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart end=1024\n",
+        ));
+        let read_result = read_header(&mut rdr);
+        assert!(read_result.is_err());
+    }
+
+    #[test]
+    fn read_multi_part_header_missing_end() {
         let mut rdr = BufReader::new(std::io::Cursor::new(
             b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0\n",
         ));
