@@ -150,7 +150,10 @@ where
     }
 }
 
-/// Read the first lines from the reader and parse the header (including the part line if expected).
+/// Parse the header lines.
+///
+/// For single-part binaries, the begin line is parsed.
+/// For multi-part binaries, both the begin and the part line are parsed.
 ///
 /// # Errors
 ///
@@ -272,6 +275,141 @@ impl Header {
     }
 }
 
+/// Parse the footer line.
+///
+/// After parsing the footer line it verifies the following:
+///
+/// * For single-part binaries, the footer should contain a value for the size field
+/// that is equal to that of the header.
+///
+/// * For multi-part binaries, the footer should contain a value for the size field
+/// that equals the difference between the 'begin' and 'end' fields of the header,
+/// a value for the part field that is equal to that of the header, and a value for
+/// the total field that is equal to the header.
+///
+/// # Errors
+///
+/// This function will return an error if the footer contains values that do not match the header.
+fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError> {
+    let end_line = parse_keywords(line_buf)?;
+
+    match header {
+        Header::Single {
+            name,
+            size: expected_size,
+            ..
+        } => {
+            return match end_line {
+                Keywords {
+                    name: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    line_length: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    part: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    total: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    pcrc32: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    begin: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    end: Some(keyword), ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    size: Some(size),
+                    crc32,
+                    ..
+                } => {
+                    size.expect(expected_size)?;
+
+                    Ok(MetaData::Single {
+                        name,
+                        size: expected_size,
+                        crc32: crc32.map(Keyword::value),
+                    })
+                }
+                _ => Err(DecodeError::InvalidHeader {
+                    line: buf_to_string(&line_buf),
+                    position: line_buf.len(),
+                }),
+            }
+        }
+
+        Header::Multi {
+            name,
+            begin,
+            end,
+            part: expected_part,
+            total: expected_total,
+            size: total_size,
+            ..
+        } => {
+            return match end_line {
+                Keywords {
+                    name: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    line_length: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    begin: Some(keyword),
+                    ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    end: Some(keyword), ..
+                } => Err(keyword.unexpected()),
+                Keywords {
+                    size: Some(size),
+                    pcrc32: Some(Keyword { value: pcrc32, .. }),
+                    part: Some(part),
+                    total: Some(total),
+                    crc32,
+                    ..
+                } => {
+                    // Recompute expected part size.
+                    let expected_size = end - begin;
+
+                    // Verify that the footer contains the expected size.
+                    size.expect(expected_size)?;
+
+                    // Verify that part and total in the footer matches the header.
+                    let part = part.expect(expected_part)?;
+                    let total = total.expect(expected_total)?;
+
+                    Ok(MetaData::Multi {
+                        name,
+                        size: total_size,
+                        crc32: crc32.map(Keyword::value),
+                        total,
+                        part,
+                        begin,
+                        end,
+                        pcrc32,
+                    })
+                }
+                _ => Err(DecodeError::InvalidHeader {
+                    line: buf_to_string(&line_buf),
+                    position: line_buf.len(),
+                }),
+            };
+        }
+    }
+}
+
 /// Read the remaining bytes and write them to the output.
 ///
 /// # Errors
@@ -300,154 +438,49 @@ where
         }
 
         if line_buf.starts_with(b"=yend ") {
-            let end_line = parse_keywords(&line_buf)?;
+            let metadata = read_footer(header, &line_buf)?;
 
-            match header {
-                Header::Single {
-                    name,
+            return match metadata {
+                MetaData::Single {
                     size: expected_size,
+                    crc32,
                     ..
                 } => {
-                    return match end_line {
-                        Keywords {
-                            name: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            line_length: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            part: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            total: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            pcrc32: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            begin: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            end: Some(keyword), ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            size: Some(size),
-                            crc32,
-                            ..
-                        } => {
-                            size.expect(expected_size)?;
-
-                            if expected_size != actual_size {
-                                Err(DecodeError::IncompleteData {
-                                    expected_size,
-                                    actual_size,
-                                })
-                            } else {
-                                if let Some(Keyword { value, .. }) = crc32 {
-                                    if value != checksum.finalize() {
-                                        Err(DecodeError::InvalidChecksum)
-                                    } else {
-                                        Ok(MetaData::Single {
-                                            name,
-                                            size: expected_size,
-                                            crc32: Some(value),
-                                        })
-                                    }
-                                } else {
-                                    Ok(MetaData::Single {
-                                        name,
-                                        size: expected_size,
-                                        crc32: None,
-                                    })
-                                }
-                            }
-                        }
-                        _ => Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(&line_buf),
-                            position: line_buf.len(),
-                        }),
+                    if expected_size != actual_size {
+                        return Err(DecodeError::IncompleteData {
+                            expected_size,
+                            actual_size,
+                        });
                     }
-                }
 
-                Header::Multi {
-                    name,
-                    begin,
-                    end,
-                    part: expected_part,
-                    total: expected_total,
-                    size: total_size,
-                    ..
-                } => {
-                    return match end_line {
-                        Keywords {
-                            name: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            line_length: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            begin: Some(keyword),
-                            ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            end: Some(keyword), ..
-                        } => Err(keyword.unexpected()),
-                        Keywords {
-                            size: Some(size),
-                            pcrc32: Some(Keyword { value: pcrc32, .. }),
-                            part: Some(part),
-                            total: Some(total),
-                            crc32,
-                            ..
-                        } => {
-                            // Recompute expected part size.
-                            let expected_size = end - begin;
-
-                            // Verify that the footer contains the expected size.
-                            size.expect(expected_size)?;
-
-                            // Verify that the actual size matches the expected size.
-                            if expected_size != actual_size {
-                                return Err(DecodeError::IncompleteData {
-                                    expected_size,
-                                    actual_size,
-                                });
-                            }
-
-                            // Verify that part and total in the footer matches the header.
-                            let part = part.expect(expected_part)?;
-                            let total = total.expect(expected_total)?;
-
-                            return if pcrc32 != checksum.finalize() {
-                                Err(DecodeError::InvalidChecksum)
-                            } else {
-                                Ok(MetaData::Multi {
-                                    name,
-                                    size: total_size,
-                                    crc32: crc32.map(Keyword::value),
-                                    total,
-                                    part,
-                                    begin,
-                                    end,
-                                    pcrc32,
-                                })
-                            };
+                    if let Some(value) = crc32 {
+                        if value != checksum.finalize() {
+                            return Err(DecodeError::InvalidChecksum);
                         }
-                        _ => Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(&line_buf),
-                            position: line_buf.len(),
-                        }),
-                    };
+                    }
+
+                    Ok(metadata)
                 }
-            }
+
+                MetaData::Multi {
+                    begin, end, pcrc32, ..
+                } => {
+                    let expected_size = end - begin;
+
+                    if expected_size != actual_size {
+                        return Err(DecodeError::IncompleteData {
+                            expected_size,
+                            actual_size,
+                        });
+                    }
+
+                    if pcrc32 != checksum.finalize() {
+                        return Err(DecodeError::InvalidChecksum);
+                    }
+
+                    Ok(metadata)
+                }
+            };
         } else {
             let decoded = decode_buffer(&line_buf)?;
             checksum.update(&decoded);
