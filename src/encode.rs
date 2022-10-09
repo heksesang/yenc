@@ -1,7 +1,7 @@
 use super::constants::{CR, DEFAULT_LINE_SIZE, DOT, ESCAPE, LF, NUL};
 use super::errors::EncodeError;
 
-use std::fs::File;
+use fs_err::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -106,7 +106,7 @@ impl EncodeOptions {
             Some(s) => s.to_str().unwrap_or(""),
             None => "",
         };
-        let input_file = File::open(&input_path)?;
+        let input_file = File::open(input_path.as_ref())?;
         let length = input_file.metadata()?.len();
 
         self.encode_stream(input_file, output, length, input_filename)

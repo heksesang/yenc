@@ -1,8 +1,8 @@
+use fs_err::{create_dir, remove_dir, remove_file, File};
 use rand::random;
 use std::env::temp_dir;
-use std::fs::{create_dir, remove_dir, remove_file, File};
 use std::io::{Read, Result, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 lazy_static::lazy_static! {
@@ -116,7 +116,7 @@ fn encode_decode_are_equal(data: &[u8], filename: &str) -> Result<bool> {
     Ok(result)
 }
 
-fn identical<P: AsRef<Path>>(file1: P, file2: P) -> bool {
+fn identical<P: Into<PathBuf>>(file1: P, file2: P) -> bool {
     let mut data1 = Vec::new();
     let size1 = File::open(file1).unwrap().read_to_end(&mut data1).unwrap();
     let mut data2 = Vec::new();

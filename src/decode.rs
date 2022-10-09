@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use fs_err::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 

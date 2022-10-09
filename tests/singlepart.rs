@@ -1,5 +1,5 @@
+use fs_err::File;
 use std::env::temp_dir;
-use std::fs::File;
 use std::io::Read;
 
 #[test]
