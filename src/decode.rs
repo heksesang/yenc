@@ -170,21 +170,6 @@ where
 
         match begin_line {
             Keywords {
-                begin: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                end: Some(keyword), ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                crc32: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                pcrc32: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
                 name: Some(Keyword { value: name, .. }),
                 size: Some(Keyword { value: size, .. }),
                 line_length: Some(_),
@@ -301,14 +286,6 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
         } => {
             return match end_line {
                 Keywords {
-                    name: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    line_length: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
                     part: Some(keyword),
                     ..
                 } => Err(keyword.unexpected()),
@@ -319,13 +296,6 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
                 Keywords {
                     pcrc32: Some(keyword),
                     ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    begin: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    end: Some(keyword), ..
                 } => Err(keyword.unexpected()),
                 Keywords {
                     size: Some(size),
@@ -357,21 +327,6 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
             ..
         } => {
             return match end_line {
-                Keywords {
-                    name: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    line_length: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    begin: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    end: Some(keyword), ..
-                } => Err(keyword.unexpected()),
                 Keywords {
                     size: Some(size),
                     pcrc32: Some(Keyword { value: pcrc32, .. }),
@@ -573,6 +528,8 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
         }
     };
 
+    let line_kind = &line_buf[..offset - 1];
+
     let mut values: Keywords<'_> = Keywords::default();
     let mut state = State::Keyword;
 
@@ -601,7 +558,7 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                     };
                 }
                 b'=' => {
-                    if keyword.is_empty() || !is_known_keyword(keyword) {
+                    if keyword.is_empty() || !is_known_keyword(line_kind, keyword) {
                         return Err(DecodeError::InvalidHeader {
                             line: buf_to_string(line_buf),
                             position,
@@ -1004,10 +961,17 @@ fn buf_to_string(line_buf: &[u8]) -> String {
     String::from_utf8_lossy(line_buf).to_string()
 }
 
-fn is_known_keyword(keyword_slice: &[u8]) -> bool {
-    matches!(
+fn is_known_keyword(line_kind: &[u8], keyword_slice: &[u8]) -> bool {
+    line_kind == b"=ybegin"
+        && matches!(
         keyword_slice,
-        b"begin" | b"crc32" | b"end" | b"line" | b"name" | b"part" | b"pcrc32" | b"size" | b"total"
+            b"line" | b"name" | b"part" | b"size" | b"total"
+        )
+        || line_kind == b"=ypart" && matches!(keyword_slice, b"begin" | b"end")
+        || line_kind == b"=yend"
+            && matches!(
+                keyword_slice,
+                b"crc32" | b"part" | b"pcrc32" | b"size" | b"total"
     )
 }
 
