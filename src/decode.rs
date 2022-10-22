@@ -139,14 +139,11 @@ where
             .open(&output_pathbuf)
             .map(BufWriter::new)?;
 
-        match header {
-            Header::Single { .. } => read_remaining(header, &mut rdr, output),
-
-            Header::Multi { begin, .. } => {
-                output.seek(SeekFrom::Start((begin - 1) as u64))?;
-                read_remaining(header, &mut rdr, output)
-            }
+        if let Header::Multi { begin, .. } = header {
+            output.seek(SeekFrom::Start((begin - 1) as u64))?;
         }
+
+        read_remaining(header, &mut rdr, output)
     }
 }
 
@@ -302,7 +299,7 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
                     crc32,
                     ..
                 } => {
-                    size.expect(expected_size)?;
+                    size.should_equal(expected_size)?;
 
                     Ok(MetaData::Single {
                         name,
@@ -339,11 +336,11 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
                     let expected_size = end - begin;
 
                     // Verify that the footer contains the expected size.
-                    size.expect(expected_size)?;
+                    size.should_equal(expected_size)?;
 
                     // Verify that part and total in the footer matches the header.
-                    let part = part.expect(expected_part)?;
-                    let total = total.expect(expected_total)?;
+                    let part = part.should_equal(expected_part)?;
+                    let total = total.should_equal(expected_total)?;
 
                     Ok(MetaData::Multi {
                         name,
@@ -445,19 +442,15 @@ where
     }
 
     match header {
-        Header::Single {
-            size: expected_size,
-            ..
-        } => {
+        Header::Single { size, .. } => {
             return Err(DecodeError::IncompleteData {
-                expected_size,
+                expected_size: size,
                 actual_size,
             });
         }
         Header::Multi { begin, end, .. } => {
-            let expected_size = end - begin;
             return Err(DecodeError::IncompleteData {
-                expected_size,
+                expected_size: end - begin,
                 actual_size,
             });
         }
@@ -759,7 +752,7 @@ impl<T> Keyword<'_, T> {
         }
     }
 
-    fn expect(&self, expected_value: T) -> Result<T, DecodeError>
+    fn should_equal(&self, expected_value: T) -> Result<T, DecodeError>
     where
         T: PartialEq,
     {
