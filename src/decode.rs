@@ -575,307 +575,155 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                     });
                 }
             },
-            State::Value => match keyword {
-                b"name" => match c {
-                    CR => {}
-                    LF => {
-                        state = State::End;
-                        if let Some(value_start) = value_start_idx {
-                            if let Some(keyword_start) = keyword_start_idx {
-                                values.name = Some(Keyword {
-                                    keyword_start,
-                                    value_start,
-                                    value: buf_to_string(value),
-                                    line_buf,
-                                });
-                            }
-                        }
-                    }
-                    _ => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                },
-                b"size" => match c {
-                    b'0'..=b'9' => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                    SPACE | LF | CR => {
-                        match String::from_utf8_lossy(value).parse::<usize>() {
-                            Ok(value) => {
-                                if let Some(value_start) = value_start_idx {
-                                    if let Some(keyword_start) = keyword_start_idx {
-                                        values.size = Some(Keyword {
+            State::Value => match c {
+                CR => {}
+                LF | SPACE if is_end_character(keyword, c) => {
+                    state = match c {
+                        LF => State::End,
+                        SPACE => State::Keyword,
+                        _ => unreachable!(),
+                    };
+                    if let Some(value_start) = value_start_idx {
+                        if let Some(keyword_start) = keyword_start_idx {
+                            match keyword {
+                                b"name" => {
+                                    values.name = Some(Keyword {
+                                        keyword_start,
+                                        value_start,
+                                        value: buf_to_string(value),
+                                        line_buf,
+                                    })
+                                }
+                                b"size" | b"begin" | b"end" => {
+                                    let parsed_value = std::str::from_utf8(value)
+                                        .ok()
+                                        .and_then(|s| s.parse::<usize>().ok())
+                                        .ok_or_else(|| DecodeError::InvalidHeader {
+                                            line: buf_to_string(line_buf),
+                                            position,
+                                        })
+                                        .map(|value| Keyword {
                                             keyword_start,
                                             value_start,
                                             value,
                                             line_buf,
-                                        });
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                        state = State::Keyword;
-                        keyword_start_idx = None;
-                        value_start_idx = None;
-                    }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    }
-                },
-                b"begin" | b"end" => match c {
-                    b'0'..=b'9' => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                    SPACE | LF | CR => {
-                        let value =
-                            String::from_utf8_lossy(value)
-                                .parse::<usize>()
-                                .map_err(|_| DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })?;
+                                        })?;
 
-                        if keyword == b"begin" {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.begin = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
+                                    match keyword {
+                                        b"size" => {
+                                            values.size = Some(parsed_value);
+                                        }
+                                        b"begin" => {
+                                            values.begin = Some(parsed_value);
+                                        }
+                                        b"end" => {
+                                            values.end = Some(parsed_value);
+                                        }
+                                        _ => unreachable!(),
+                                    }
                                 }
-                            }
-                        } else {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.end = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
-                                }
-                            }
-                        }
-                        state = State::Keyword;
-                        keyword_start_idx = None;
-                        value_start_idx = None;
-                    }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    }
-                },
-                b"line" => match c {
-                    b'0'..=b'9' => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                    SPACE | LF | CR => {
-                        match String::from_utf8_lossy(value).parse::<u16>() {
-                            Ok(value) => {
-                                if let Some(value_start) = value_start_idx {
-                                    if let Some(keyword_start) = keyword_start_idx {
-                                        values.line_length = Some(Keyword {
+                                b"crc32" | b"pcrc32" => {
+                                    let parsed_value = std::str::from_utf8(value)
+                                        .ok()
+                                        .and_then(|s| u32::from_str_radix(s, 16).ok())
+                                        .ok_or_else(|| DecodeError::InvalidHeader {
+                                            line: buf_to_string(line_buf),
+                                            position,
+                                        })
+                                        .map(|value| Keyword {
                                             keyword_start,
                                             value_start,
                                             value,
                                             line_buf,
-                                        });
+                                        })?;
+
+                                    match keyword {
+                                        b"crc32" => {
+                                            values.crc32 = Some(parsed_value);
+                                        }
+                                        b"pcrc32" => {
+                                            values.pcrc32 = Some(parsed_value);
+                                        }
+                                        _ => unreachable!(),
                                     }
                                 }
-                            }
-                            Err(_) => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                        state = State::Keyword;
-                        keyword_start_idx = None;
-                        value_start_idx = None;
-                    }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    }
-                },
-                b"part" | b"total" => match c {
-                    b'0'..=b'9' => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                    SPACE | LF | CR => {
-                        let value =
-                            String::from_utf8_lossy(value).parse::<u32>().map_err(|_| {
-                                DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
+                                b"part" | b"total" => {
+                                    let parsed_value = std::str::from_utf8(value)
+                                        .ok()
+                                        .and_then(|s| s.parse::<u32>().ok())
+                                        .ok_or_else(|| DecodeError::InvalidHeader {
+                                            line: buf_to_string(line_buf),
+                                            position,
+                                        })
+                                        .map(|value| Keyword {
+                                            keyword_start,
+                                            value_start,
+                                            value,
+                                            line_buf,
+                                        })?;
+
+                                    match keyword {
+                                        b"part" => {
+                                            values.part = Some(parsed_value);
+                                        }
+                                        b"total" => {
+                                            values.total = Some(parsed_value);
+                                        }
+                                        _ => unreachable!(),
+                                    }
                                 }
-                            })?;
-                        if keyword == b"part" {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.part = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
+                                b"line" => {
+                                    let parsed_value = std::str::from_utf8(value)
+                                        .ok()
+                                        .and_then(|s| s.parse::<u16>().ok())
+                                        .ok_or_else(|| DecodeError::InvalidHeader {
+                                            line: buf_to_string(line_buf),
+                                            position,
+                                        })
+                                        .map(|value| Keyword {
+                                            keyword_start,
+                                            value_start,
+                                            value,
+                                            line_buf,
+                                        })?;
+
+                                    values.line_length = Some(parsed_value);
                                 }
-                            }
-                        } else {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.total = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
-                                }
+                                _ => unreachable!(),
                             }
                         }
-                        state = State::Keyword;
-                        keyword_start_idx = None;
-                        value_start_idx = None;
                     }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    }
-                },
-                b"crc32" | b"pcrc32" => match c {
-                    b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f' => {
-                        if value_start_idx.is_none() {
-                            value_start_idx = Some(position);
-                        }
-                        value = match value_start_idx {
-                            Some(idx) => &line_buf[idx..=position],
-                            None => {
-                                return Err(DecodeError::InvalidHeader {
-                                    line: buf_to_string(line_buf),
-                                    position,
-                                })
-                            }
-                        };
-                    }
-                    SPACE | LF | CR => {
-                        let value = u32::from_str_radix(&String::from_utf8_lossy(value), 16)
-                            .map_err(|_| DecodeError::InvalidHeader {
-                                line: buf_to_string(line_buf),
-                                position,
-                            })?;
-                        if keyword == b"crc32" {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.crc32 = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
-                                }
-                            }
-                        } else {
-                            if let Some(value_start) = value_start_idx {
-                                if let Some(keyword_start) = keyword_start_idx {
-                                    values.pcrc32 = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value,
-                                        line_buf,
-                                    });
-                                }
-                            }
-                        }
-                        state = State::Keyword;
-                        keyword_start_idx = None;
-                        value_start_idx = None;
-                    }
-                    _ => {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    }
-                },
-                _ => unreachable!(),
+                    keyword_start_idx = None;
+                    value_start_idx = None;
+                }
+                c if is_valid_character(keyword, c) => {
+                    let idx = *value_start_idx.get_or_insert(position);
+                    value = &line_buf[idx..=position];
+                }
+                _ => {
+                    return Err(DecodeError::InvalidHeader {
+                        line: buf_to_string(line_buf),
+                        position,
+                    })
+                }
             },
         };
     }
 
     Ok(values)
+}
+
+fn is_end_character(keyword: &[u8], c: u8) -> bool {
+    c == LF || (keyword != b"name" && c == SPACE)
+}
+
+fn is_valid_character(keyword: &[u8], c: u8) -> bool {
+    match keyword {
+        b"name" => true,
+        b"size" | b"line" | b"part" | b"total" | b"begin" | b"end" => matches!(c, b'0'..=b'9'),
+        b"crc32" | b"pcrc32" => matches!(c, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f'),
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
