@@ -621,7 +621,7 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                             }
                         };
                     }
-                    SPACE => {
+                    SPACE | LF | CR => {
                         match String::from_utf8_lossy(value).parse::<usize>() {
                             Ok(value) => {
                                 if let Some(value_start) = value_start_idx {
@@ -726,7 +726,7 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                             }
                         };
                     }
-                    SPACE => {
+                    SPACE | LF | CR => {
                         match String::from_utf8_lossy(value).parse::<u16>() {
                             Ok(value) => {
                                 if let Some(value_start) = value_start_idx {
@@ -773,7 +773,7 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                             }
                         };
                     }
-                    SPACE => {
+                    SPACE | LF | CR => {
                         let value =
                             String::from_utf8_lossy(value).parse::<u32>().map_err(|_| {
                                 DecodeError::InvalidHeader {
@@ -830,12 +830,7 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                             }
                         };
                     }
-                    SPACE | LF => {
-                        state = if c == SPACE {
-                            State::Keyword
-                        } else {
-                            State::End
-                        };
+                    SPACE | LF | CR => {
                         let value = u32::from_str_radix(&String::from_utf8_lossy(value), 16)
                             .map_err(|_| DecodeError::InvalidHeader {
                                 line: buf_to_string(line_buf),
@@ -864,10 +859,10 @@ fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
                                 }
                             }
                         }
+                        state = State::Keyword;
                         keyword_start_idx = None;
                         value_start_idx = None;
                     }
-                    CR => {}
                     _ => {
                         return Err(DecodeError::InvalidHeader {
                             line: buf_to_string(line_buf),
@@ -964,7 +959,7 @@ fn buf_to_string(line_buf: &[u8]) -> String {
 fn is_known_keyword(line_kind: &[u8], keyword_slice: &[u8]) -> bool {
     line_kind == b"=ybegin"
         && matches!(
-        keyword_slice,
+            keyword_slice,
             b"line" | b"name" | b"part" | b"size" | b"total"
         )
         || line_kind == b"=ypart" && matches!(keyword_slice, b"begin" | b"end")
@@ -972,7 +967,7 @@ fn is_known_keyword(line_kind: &[u8], keyword_slice: &[u8]) -> bool {
             && matches!(
                 keyword_slice,
                 b"crc32" | b"part" | b"pcrc32" | b"size" | b"total"
-    )
+            )
 }
 
 #[cfg(test)]
