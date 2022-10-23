@@ -12,63 +12,37 @@ pub struct DecodeOptions<P> {
     output_dir: P,
 }
 
-/// Metadata contained in the header lines.
+/// Metadata of the message.
 #[derive(Debug, PartialEq, Eq)]
-pub enum MetaData {
-    /// Describes a single-part binary.
-    Single {
-        /// The name of the original binary file.
-        name: String,
-        /// The size of the original unencoded binary file.
-        size: usize,
-        /// The CRC32 checksum of the entire encoded binary.
-        crc32: Option<u32>,
-    },
-    /// Describes part of a multi-part binary.
-    Multi {
-        /// The name of the original binary file.
-        name: String,
-        /// The size of the original unencoded binary.
-        size: usize,
-        /// The CRC32 checksum of the entire encoded binary.
-        crc32: Option<u32>,
-        /// The total amount of parts.
-        total: u32,
-        /// The part number of the encoded part.
-        part: u32,
-        /// The starting point of the block in the original unencoded binary.
-        begin: usize,
-        /// The ending point of the block in the original unencoded binary.
-        end: usize,
-        /// The CRC32 checksum of the encoded part.
-        pcrc32: u32,
-    },
+pub struct MetaData {
+    /// Metadata describing the original file.
+    file: FileMetaData,
+    /// Metadata describing the decoded block.
+    part: PartMetaData,
 }
 
-impl MetaData {
-    /// Returns the filename of the original unencoded binary.
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Single { name, .. } => &name,
-            Self::Multi { name, .. } => &name,
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileMetaData {
+    /// The name of the original binary file.
+    name: String,
+    /// The size of the original unencoded binary.
+    size: usize,
+    /// The CRC32 checksum of the entire encoded binary.
+    crc32: Option<u32>,
+    /// The total amount of parts.
+    parts: u32,
+}
 
-    /// Returns the size of the original unencoded binary.
-    pub fn size(&self) -> usize {
-        match self {
-            Self::Single { size, .. } => *size,
-            Self::Multi { size, .. } => *size,
-        }
-    }
-
-    /// Returns the CRC32 checksum of the original unencoded binary.
-    pub fn crc32(&self) -> Option<u32> {
-        match self {
-            Self::Single { crc32, .. } => *crc32,
-            Self::Multi { crc32, .. } => *crc32,
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub struct PartMetaData {
+    /// The part number of the part.
+    part_number: u32,
+    /// The starting point of the block in the original unencoded binary.
+    begin: usize,
+    /// The ending point of the block in the original unencoded binary.
+    end: usize,
+    /// The CRC32 checksum of the encoded part.
+    crc32: Option<u32>,
 }
 
 impl<P> DecodeOptions<P>
@@ -108,7 +82,7 @@ where
     {
         self.decode(read_stream).map(|metadata| {
             let mut output_pathbuf = self.output_dir.as_ref().to_path_buf();
-            output_pathbuf.push(metadata.name().trim());
+            output_pathbuf.push(metadata.file.name.trim());
             output_pathbuf.into_boxed_path()
         })
     }
@@ -155,9 +129,9 @@ where
 /// # Errors
 ///
 /// This function will return an error if the header is invalid.
-fn read_header<R>(rdr: &mut BufReader<R>) -> Result<Header, DecodeError>
+fn read_header<R>(rdr: &mut R) -> Result<Header, DecodeError>
 where
-    R: Read,
+    R: BufRead,
 {
     let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
     rdr.read_until(LF, &mut line_buf)?;
@@ -301,10 +275,21 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
                 } => {
                     size.should_equal(expected_size)?;
 
-                    Ok(MetaData::Single {
-                        name,
-                        size: expected_size,
-                        crc32: crc32.map(Keyword::value),
+                    let crc32 = crc32.map(Keyword::value);
+
+                    Ok(MetaData {
+                        file: FileMetaData {
+                            name,
+                            size: expected_size,
+                            crc32,
+                            parts: 1,
+                        },
+                        part: PartMetaData {
+                            part_number: 1,
+                            begin: 1,
+                            end: expected_size,
+                            crc32,
+                        },
                     })
                 }
                 _ => Err(DecodeError::InvalidHeader {
@@ -342,15 +327,19 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
                     let part = part.should_equal(expected_part)?;
                     let total = total.should_equal(expected_total)?;
 
-                    Ok(MetaData::Multi {
-                        name,
-                        size: total_size,
-                        crc32: crc32.map(Keyword::value),
-                        total,
-                        part,
-                        begin,
-                        end,
-                        pcrc32,
+                    Ok(MetaData {
+                        file: FileMetaData {
+                            name,
+                            size: total_size,
+                            crc32: crc32.map(Keyword::value),
+                            parts: total,
+                        },
+                        part: PartMetaData {
+                            part_number: part,
+                            begin,
+                            end,
+                            crc32: Some(pcrc32),
+                        },
                     })
                 }
                 _ => Err(DecodeError::InvalidHeader {
@@ -392,47 +381,22 @@ where
         if line_buf.starts_with(b"=yend ") {
             let metadata = read_footer(header, &line_buf)?;
 
-            return match metadata {
-                MetaData::Single {
-                    size: expected_size,
-                    crc32,
-                    ..
-                } => {
-                    if expected_size != actual_size {
-                        return Err(DecodeError::IncompleteData {
-                            expected_size,
-                            actual_size,
-                        });
-                    }
+            let expected_size = 1 + metadata.part.end - metadata.part.begin;
 
-                    if let Some(value) = crc32 {
-                        if value != checksum.finalize() {
-                            return Err(DecodeError::InvalidChecksum);
-                        }
-                    }
+            if expected_size != actual_size {
+                return Err(DecodeError::IncompleteData {
+                    expected_size,
+                    actual_size,
+                });
+            }
 
-                    Ok(metadata)
+            if let Some(value) = metadata.part.crc32 {
+                if value != checksum.finalize() {
+                    return Err(DecodeError::InvalidChecksum);
                 }
+            }
 
-                MetaData::Multi {
-                    begin, end, pcrc32, ..
-                } => {
-                    let expected_size = end - begin;
-
-                    if expected_size != actual_size {
-                        return Err(DecodeError::IncompleteData {
-                            expected_size,
-                            actual_size,
-                        });
-                    }
-
-                    if pcrc32 != checksum.finalize() {
-                        return Err(DecodeError::InvalidChecksum);
-                    }
-
-                    Ok(metadata)
-                }
-            };
+            return Ok(metadata);
         } else {
             let decoded = decode_buffer(&line_buf)?;
             checksum.update(&decoded);
@@ -817,7 +781,7 @@ mod tests {
     use std::io::BufReader;
 
     use crate::{
-        decode::{Header, Keyword},
+        decode::{FileMetaData, Header, Keyword, PartMetaData},
         MetaData,
     };
 
@@ -833,10 +797,19 @@ mod tests {
         assert!(read_result.is_ok());
         let metadata = read_result.unwrap();
         assert_eq!(
-            MetaData::Single {
-                name: "CatOnKeyboardInSpace001.jpg".to_string(),
-                size: 26624,
-                crc32: Some(0xff00ff00),
+            MetaData {
+                file: FileMetaData {
+                    name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                    size: 26624,
+                    crc32: Some(0xff00ff00),
+                    parts: 1,
+                },
+                part: PartMetaData {
+                    part_number: 1,
+                    begin: 1,
+                    end: 26624,
+                    crc32: Some(0xff00ff00)
+                }
             },
             metadata
         );
@@ -852,14 +825,25 @@ mod tests {
         assert!(read_result.is_ok());
         let metadata = read_result.unwrap();
         assert_eq!(
-            MetaData::Single {
-                name: "CatOnKeyboardInSpace001.jpg".to_string(),
-                size: 26624,
-                crc32: None,
+            MetaData {
+                file: FileMetaData {
+                    name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                    size: 26624,
+                    crc32: None,
+                    parts: 1,
+                },
+                part: PartMetaData {
+                    part_number: 1,
+                    begin: 1,
+                    end: 26624,
+                    crc32: None
+                }
             },
             metadata
         );
     }
+
+    // TODO read_valid_multi_part_footer
 
     #[test]
     fn read_single_part_header_missing_line_length() {
