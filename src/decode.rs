@@ -105,7 +105,7 @@ where
 
         let mut output_pathbuf = self.output_dir.as_ref().to_path_buf();
 
-        output_pathbuf.push(header.name().trim());
+        output_pathbuf.push(header.file.name.trim());
 
         let mut output = OpenOptions::new()
             .create(true)
@@ -113,8 +113,8 @@ where
             .open(&output_pathbuf)
             .map(BufWriter::new)?;
 
-        if let Header::Multi { begin, .. } = header {
-            output.seek(SeekFrom::Start((begin - 1) as u64))?;
+        if header.file.parts > 1 {
+            output.seek(SeekFrom::Start((header.part.begin - 1) as u64))?;
         }
 
         read_remaining(header, &mut rdr, output)
@@ -129,7 +129,7 @@ where
 /// # Errors
 ///
 /// This function will return an error if the header is invalid.
-fn read_header<R>(rdr: &mut R) -> Result<Header, DecodeError>
+fn read_header<R>(rdr: &mut R) -> Result<MetaData, DecodeError>
 where
     R: BufRead,
 {
@@ -159,13 +159,19 @@ where
                             begin: Some(Keyword { value: begin, .. }),
                             end: Some(Keyword { value: end, .. }),
                             ..
-                        } => Ok(Header::Multi {
-                            name,
-                            size,
-                            part,
-                            total,
-                            begin,
-                            end,
+                        } => Ok(MetaData {
+                            file: FileMetaData {
+                                name,
+                                size,
+                                crc32: None,
+                                parts: total,
+                            },
+                            part: PartMetaData {
+                                part_number: part,
+                                begin,
+                                end,
+                                crc32: None,
+                            },
                         }),
                         _ => Err(DecodeError::InvalidHeader {
                             line: buf_to_string(&line_buf),
@@ -192,7 +198,20 @@ where
                 size: Some(Keyword { value: size, .. }),
                 line_length: Some(_),
                 ..
-            } => Ok(Header::Single { name, size }),
+            } => Ok(MetaData {
+                file: FileMetaData {
+                    name,
+                    size,
+                    crc32: None,
+                    parts: 1,
+                },
+                part: PartMetaData {
+                    part_number: 1,
+                    begin: 1,
+                    end: size,
+                    crc32: None,
+                },
+            }),
             _ => Err(DecodeError::InvalidHeader {
                 line: buf_to_string(&line_buf),
                 position: line_buf.len(),
@@ -203,31 +222,6 @@ where
             line: buf_to_string(&line_buf),
             position: 0,
         })
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Header {
-    Single {
-        name: String,
-        size: usize,
-    },
-    Multi {
-        name: String,
-        size: usize,
-        part: u32,
-        total: u32,
-        begin: usize,
-        end: usize,
-    },
-}
-
-impl Header {
-    pub fn name(&self) -> &str {
-        match self {
-            Header::Single { name, .. } => &name,
-            Header::Multi { name, .. } => &name,
-        }
     }
 }
 
@@ -246,107 +240,71 @@ impl Header {
 /// # Errors
 ///
 /// This function will return an error if the footer contains values that do not match the header.
-fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError> {
+fn read_footer(mut header: MetaData, line_buf: &[u8]) -> Result<MetaData, DecodeError> {
     let end_line = parse_keywords(line_buf)?;
 
-    match header {
-        Header::Single {
-            name,
-            size: expected_size,
-            ..
-        } => {
-            return match end_line {
-                Keywords {
-                    part: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    total: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    pcrc32: Some(keyword),
-                    ..
-                } => Err(keyword.unexpected()),
-                Keywords {
-                    size: Some(size),
-                    crc32,
-                    ..
-                } => {
-                    size.should_equal(expected_size)?;
+    if header.file.parts > 1 {
+        match end_line {
+            Keywords {
+                size: Some(size),
+                pcrc32: Some(Keyword { value: pcrc32, .. }),
+                part: Some(part),
+                total: Some(total),
+                crc32,
+                ..
+            } => {
+                // Recompute expected part size.
+                let expected_size = 1 + header.part.end - header.part.begin;
 
-                    let crc32 = crc32.map(Keyword::value);
+                // Verify that the footer contains the expected size.
+                size.should_equal(expected_size)?;
 
-                    Ok(MetaData {
-                        file: FileMetaData {
-                            name,
-                            size: expected_size,
-                            crc32,
-                            parts: 1,
-                        },
-                        part: PartMetaData {
-                            part_number: 1,
-                            begin: 1,
-                            end: expected_size,
-                            crc32,
-                        },
-                    })
-                }
-                _ => Err(DecodeError::InvalidHeader {
-                    line: buf_to_string(&line_buf),
-                    position: line_buf.len(),
-                }),
+                // Verify that part and total in the footer matches the header.
+                part.should_equal(header.part.part_number)?;
+                total.should_equal(header.file.parts)?;
+
+                header.file.crc32 = crc32.map(Keyword::value);
+                header.part.crc32 = Some(pcrc32);
+
+                Ok(header)
             }
+            _ => Err(DecodeError::InvalidHeader {
+                line: buf_to_string(&line_buf),
+                position: line_buf.len(),
+            }),
         }
+    } else {
+        match end_line {
+            Keywords {
+                part: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                total: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                pcrc32: Some(keyword),
+                ..
+            } => Err(keyword.unexpected()),
+            Keywords {
+                size: Some(size),
+                crc32,
+                ..
+            } => {
+                size.should_equal(header.file.size)?;
 
-        Header::Multi {
-            name,
-            begin,
-            end,
-            part: expected_part,
-            total: expected_total,
-            size: total_size,
-            ..
-        } => {
-            return match end_line {
-                Keywords {
-                    size: Some(size),
-                    pcrc32: Some(Keyword { value: pcrc32, .. }),
-                    part: Some(part),
-                    total: Some(total),
-                    crc32,
-                    ..
-                } => {
-                    // Recompute expected part size.
-                    let expected_size = end - begin;
+                let crc32 = crc32.map(Keyword::value);
 
-                    // Verify that the footer contains the expected size.
-                    size.should_equal(expected_size)?;
+                header.file.crc32 = crc32;
+                header.part.crc32 = crc32;
 
-                    // Verify that part and total in the footer matches the header.
-                    let part = part.should_equal(expected_part)?;
-                    let total = total.should_equal(expected_total)?;
-
-                    Ok(MetaData {
-                        file: FileMetaData {
-                            name,
-                            size: total_size,
-                            crc32: crc32.map(Keyword::value),
-                            parts: total,
-                        },
-                        part: PartMetaData {
-                            part_number: part,
-                            begin,
-                            end,
-                            crc32: Some(pcrc32),
-                        },
-                    })
-                }
-                _ => Err(DecodeError::InvalidHeader {
-                    line: buf_to_string(&line_buf),
-                    position: line_buf.len(),
-                }),
-            };
+                Ok(header)
+            }
+            _ => Err(DecodeError::InvalidHeader {
+                line: buf_to_string(&line_buf),
+                position: line_buf.len(),
+            }),
         }
     }
 }
@@ -358,7 +316,7 @@ fn read_footer(header: Header, line_buf: &[u8]) -> Result<MetaData, DecodeError>
 /// This function will return an error if the data is not
 /// the expected size or the checksum does not match.
 fn read_remaining<R, W>(
-    header: Header,
+    header: MetaData,
     rdr: &mut BufReader<R>,
     mut output: W,
 ) -> Result<MetaData, DecodeError>
@@ -405,19 +363,16 @@ where
         }
     }
 
-    match header {
-        Header::Single { size, .. } => {
-            return Err(DecodeError::IncompleteData {
-                expected_size: size,
-                actual_size,
-            });
-        }
-        Header::Multi { begin, end, .. } => {
-            return Err(DecodeError::IncompleteData {
-                expected_size: end - begin,
-                actual_size,
-            });
-        }
+    if header.file.parts > 1 {
+        Err(DecodeError::IncompleteData {
+            expected_size: 1 + header.part.end - header.part.begin,
+            actual_size,
+        })
+    } else {
+        Err(DecodeError::IncompleteData {
+            expected_size: header.file.size,
+            actual_size,
+        })
     }
 }
 
@@ -781,7 +736,7 @@ mod tests {
     use std::io::BufReader;
 
     use crate::{
-        decode::{FileMetaData, Header, Keyword, PartMetaData},
+        decode::{FileMetaData, Keyword, PartMetaData},
         MetaData,
     };
 
@@ -789,9 +744,19 @@ mod tests {
 
     #[test]
     fn read_valid_single_part_footer() {
-        let header = Header::Single {
-            name: "CatOnKeyboardInSpace001.jpg".to_string(),
-            size: 26624,
+        let header = MetaData {
+            file: FileMetaData {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624,
+                crc32: None,
+                parts: 1,
+            },
+            part: PartMetaData {
+                part_number: 1,
+                begin: 1,
+                end: 26624,
+                crc32: None,
+            },
         };
         let read_result = read_footer(header, b"=yend size=26624 crc32=ff00ff00\n");
         assert!(read_result.is_ok());
@@ -817,9 +782,19 @@ mod tests {
 
     #[test]
     fn read_valid_single_part_footer_without_crc32() {
-        let header = Header::Single {
-            name: "CatOnKeyboardInSpace001.jpg".to_string(),
-            size: 26624,
+        let header = MetaData {
+            file: FileMetaData {
+                name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                size: 26624,
+                crc32: None,
+                parts: 1,
+            },
+            part: PartMetaData {
+                part_number: 1,
+                begin: 1,
+                end: 26624,
+                crc32: None,
+            },
         };
         let read_result = read_footer(header, b"=yend size=26624\n");
         assert!(read_result.is_ok());
@@ -879,9 +854,19 @@ mod tests {
         assert!(read_result.is_ok());
         let header = read_result.unwrap();
         assert_eq!(
-            Header::Single {
-                name: "CatOnKeyboardInSpace001.jpg".to_string(),
-                size: 26624
+            MetaData {
+                file: FileMetaData {
+                    name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                    size: 26624,
+                    crc32: None,
+                    parts: 1,
+                },
+                part: PartMetaData {
+                    part_number: 1,
+                    begin: 1,
+                    end: 26624,
+                    crc32: None,
+                },
             },
             header
         );
@@ -926,19 +911,25 @@ mod tests {
     #[test]
     fn read_valid_multi_part_header() {
         let mut rdr = BufReader::new(std::io::Cursor::new(
-            b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
+            b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=1 end=1024\n",
         ));
         let read_result = read_header(&mut rdr);
         assert!(read_result.is_ok());
         let header = read_result.unwrap();
         assert_eq!(
-            Header::Multi {
-                name: "CatOnKeyboardInSpace001.jpg".to_string(),
-                size: 26624,
-                part: 1,
-                total: 27,
-                begin: 0,
-                end: 1024,
+            MetaData {
+                file: FileMetaData {
+                    name: "CatOnKeyboardInSpace001.jpg".to_string(),
+                    size: 26624,
+                    crc32: None,
+                    parts: 27,
+                },
+                part: PartMetaData {
+                    part_number: 1,
+                    begin: 1,
+                    end: 1024,
+                    crc32: None,
+                },
             },
             header
         );
