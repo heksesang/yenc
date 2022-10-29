@@ -12,39 +12,6 @@ pub struct DecodeOptions<P> {
     output_dir: P,
 }
 
-/// Metadata of the message.
-#[derive(Debug, PartialEq, Eq)]
-pub struct MetaData {
-    /// Metadata describing the original file.
-    file: FileMetaData,
-    /// Metadata describing the decoded block.
-    part: PartMetaData,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct FileMetaData {
-    /// The name of the original binary file.
-    name: String,
-    /// The size of the original unencoded binary.
-    size: usize,
-    /// The CRC32 checksum of the entire encoded binary.
-    crc32: Option<u32>,
-    /// The total amount of parts.
-    parts: u32,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct PartMetaData {
-    /// The part number of the part.
-    part_number: u32,
-    /// The starting point of the block in the original unencoded binary.
-    begin: usize,
-    /// The ending point of the block in the original unencoded binary.
-    end: usize,
-    /// The CRC32 checksum of the encoded part.
-    crc32: Option<u32>,
-}
-
 impl<P> DecodeOptions<P>
 where
     P: AsRef<Path>,
@@ -100,25 +67,71 @@ where
     where
         R: Read,
     {
-        let mut rdr = BufReader::new(read_stream);
-        let header = read_header(&mut rdr)?;
+        decode(read_stream, |header| {
+            let mut output_pathbuf = self.output_dir.as_ref().to_path_buf();
 
-        let mut output_pathbuf = self.output_dir.as_ref().to_path_buf();
+            output_pathbuf.push(header.file.name.trim());
 
-        output_pathbuf.push(header.file.name.trim());
+            let mut output = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&output_pathbuf)
+                .map(BufWriter::new)?;
 
-        let mut output = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&output_pathbuf)
-            .map(BufWriter::new)?;
+            if header.file.parts > 1 {
+                output.seek(SeekFrom::Start((header.part.begin - 1) as u64))?;
+            }
 
-        if header.file.parts > 1 {
-            output.seek(SeekFrom::Start((header.part.begin - 1) as u64))?;
-        }
-
-        read_remaining(header, &mut rdr, output)
+            Ok(output)
+        })
     }
+}
+
+pub fn decode<R, F, W>(read_stream: R, create_output: F) -> Result<MetaData, DecodeError>
+where
+    R: Read,
+    F: FnOnce(&MetaData) -> Result<W, DecodeError>,
+    W: Write,
+{
+    let mut rdr = BufReader::new(read_stream);
+
+    let header = read_header(&mut rdr)?;
+    let output = create_output(&header)?;
+
+    read_remaining(header, &mut rdr, output)
+}
+
+/// Metadata of the message.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MetaData {
+    /// Metadata describing the original file.
+    file: FileMetaData,
+    /// Metadata describing the decoded block.
+    part: PartMetaData,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileMetaData {
+    /// The name of the original binary file.
+    name: String,
+    /// The size of the original unencoded binary.
+    size: usize,
+    /// The CRC32 checksum of the entire encoded binary.
+    crc32: Option<u32>,
+    /// The total amount of parts.
+    parts: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PartMetaData {
+    /// The part number of the part.
+    part_number: u32,
+    /// The starting point of the block in the original unencoded binary.
+    begin: usize,
+    /// The ending point of the block in the original unencoded binary.
+    end: usize,
+    /// The CRC32 checksum of the encoded part.
+    crc32: Option<u32>,
 }
 
 /// Parse the header lines.
