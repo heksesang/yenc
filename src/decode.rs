@@ -1,8 +1,17 @@
 use fs_err::OpenOptions;
+use nom::branch::{alt, permutation};
+use nom::bytes::complete::{tag, take_until, take_while_m_n};
+use nom::character::complete::{line_ending, multispace1, u16, u32, u64};
+use nom::combinator::{cond, eof, map, opt};
+use nom::error::VerboseError;
+use nom::sequence::preceded;
+use nom::{IResult, Parser};
+use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+
 use std::path::Path;
 
-use super::constants::{CR, DEFAULT_LINE_SIZE, DOT, ESCAPE, LF, NUL, SPACE};
+use super::constants::{CR, DEFAULT_LINE_SIZE, DOT, ESCAPE, LF, NUL};
 use super::errors::DecodeError;
 
 /// Options for decoding.
@@ -115,7 +124,7 @@ pub struct FileMetaData {
     /// The name of the original binary file.
     name: String,
     /// The size of the original unencoded binary.
-    size: usize,
+    size: u64,
     /// The CRC32 checksum of the entire encoded binary.
     crc32: Option<u32>,
     /// The total amount of parts.
@@ -127,9 +136,9 @@ pub struct PartMetaData {
     /// The part number of the part.
     part_number: u32,
     /// The starting point of the block in the original unencoded binary.
-    begin: usize,
+    begin: u64,
     /// The ending point of the block in the original unencoded binary.
-    end: usize,
+    end: u64,
     /// The CRC32 checksum of the encoded part.
     crc32: Option<u32>,
 }
@@ -149,91 +158,53 @@ where
     let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
     rdr.read_until(LF, &mut line_buf)?;
 
-    if line_buf.starts_with(b"=ybegin ") {
-        let begin_line = parse_keywords(&line_buf)?;
+    let s: &str = &String::from_utf8_lossy(&line_buf[..]);
 
-        match begin_line {
-            Keywords {
-                name: Some(Keyword { value: name, .. }),
-                size: Some(Keyword { value: size, .. }),
-                line_length: Some(_),
-                part: Some(Keyword { value: part, .. }),
-                total: Some(Keyword { value: total, .. }),
-                ..
-            } => {
-                let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
-                rdr.read_until(LF, &mut line_buf)?;
+    let (
+        _,
+        BeginTokens {
+            line: _,
+            size,
+            part_tokens,
+            name,
+        },
+    ) = parse_ybegin::<VerboseError<_>>(s).map_err(|e| DecodeError::from((s, e)))?;
 
-                if line_buf.starts_with(b"=ypart ") {
-                    let part_line = parse_keywords(&line_buf)?;
+    if let Some(BeginPartTokens { part, total }) = part_tokens {
+        let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
+        rdr.read_until(LF, &mut line_buf)?;
 
-                    match part_line {
-                        Keywords {
-                            begin: Some(Keyword { value: begin, .. }),
-                            end: Some(Keyword { value: end, .. }),
-                            ..
-                        } => Ok(MetaData {
-                            file: FileMetaData {
-                                name,
-                                size,
-                                crc32: None,
-                                parts: total,
-                            },
-                            part: PartMetaData {
-                                part_number: part,
-                                begin,
-                                end,
-                                crc32: None,
-                            },
-                        }),
-                        _ => Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(&line_buf),
-                            position: line_buf.len(),
-                        }),
-                    }
-                } else {
-                    Err(DecodeError::InvalidHeader {
-                        line: buf_to_string(&line_buf),
-                        position: 0,
-                    })
-                }
-            }
-            Keywords {
-                part: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                total: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                name: Some(Keyword { value: name, .. }),
-                size: Some(Keyword { value: size, .. }),
-                line_length: Some(_),
-                ..
-            } => Ok(MetaData {
-                file: FileMetaData {
-                    name,
-                    size,
-                    crc32: None,
-                    parts: 1,
-                },
-                part: PartMetaData {
-                    part_number: 1,
-                    begin: 1,
-                    end: size,
-                    crc32: None,
-                },
-            }),
-            _ => Err(DecodeError::InvalidHeader {
-                line: buf_to_string(&line_buf),
-                position: line_buf.len(),
-            }),
-        }
+        let s: &str = &String::from_utf8_lossy(&line_buf[..]);
+
+        let (_, (begin, end)) = parse_ypart(s).map_err(|e| DecodeError::from((s, e)))?;
+        Ok(MetaData {
+            file: FileMetaData {
+                name: name.to_string(),
+                size,
+                crc32: None,
+                parts: total.unwrap_or_default(),
+            },
+            part: PartMetaData {
+                part_number: part,
+                begin,
+                end,
+                crc32: None,
+            },
+        })
     } else {
-        Err(DecodeError::InvalidHeader {
-            line: buf_to_string(&line_buf),
-            position: 0,
+        Ok(MetaData {
+            file: FileMetaData {
+                name: name.to_string(),
+                size,
+                crc32: None,
+                parts: 1,
+            },
+            part: PartMetaData {
+                part_number: 1,
+                begin: 1,
+                end: size,
+                crc32: None,
+            },
         })
     }
 }
@@ -254,71 +225,26 @@ where
 ///
 /// This function will return an error if the footer contains values that do not match the header.
 fn read_footer(mut header: MetaData, line_buf: &[u8]) -> Result<MetaData, DecodeError> {
-    let end_line = parse_keywords(line_buf)?;
+    let s: &str = &String::from_utf8_lossy(&line_buf);
 
     if header.file.parts > 1 {
-        match end_line {
-            Keywords {
-                size: Some(size),
-                pcrc32: Some(Keyword { value: pcrc32, .. }),
-                part: Some(part),
-                total: Some(total),
-                crc32,
-                ..
-            } => {
-                // Recompute expected part size.
-                let expected_size = 1 + header.part.end - header.part.begin;
+        let expected_size = 1 + header.part.end - header.part.begin;
+        let expected_part = header.part.part_number;
+        let expected_part_count = header.file.parts;
 
-                // Verify that the footer contains the expected size.
-                size.should_equal(expected_size)?;
+        let res: IResult<_, _, VerboseError<_>> =
+            parse_multipart_yend(expected_size, expected_part, Some(expected_part_count))(s);
 
-                // Verify that part and total in the footer matches the header.
-                part.should_equal(header.part.part_number)?;
-                total.should_equal(header.file.parts)?;
-
-                header.file.crc32 = crc32.map(Keyword::value);
-                header.part.crc32 = Some(pcrc32);
-
-                Ok(header)
-            }
-            _ => Err(DecodeError::InvalidHeader {
-                line: buf_to_string(&line_buf),
-                position: line_buf.len(),
-            }),
-        }
+        let (_, (pcrc32, crc32)) = res.map_err(|e| DecodeError::from((s, e)))?;
+        header.file.crc32 = crc32;
+        header.part.crc32 = Some(pcrc32);
+        Ok(header)
     } else {
-        match end_line {
-            Keywords {
-                part: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                total: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                pcrc32: Some(keyword),
-                ..
-            } => Err(keyword.unexpected()),
-            Keywords {
-                size: Some(size),
-                crc32,
-                ..
-            } => {
-                size.should_equal(header.file.size)?;
-
-                let crc32 = crc32.map(Keyword::value);
-
-                header.file.crc32 = crc32;
-                header.part.crc32 = crc32;
-
-                Ok(header)
-            }
-            _ => Err(DecodeError::InvalidHeader {
-                line: buf_to_string(&line_buf),
-                position: line_buf.len(),
-            }),
-        }
+        let res: IResult<_, _, VerboseError<_>> = parse_singlepart_yend(header.file.size)(&s);
+        let (_, crc32) = res.map_err(|e| DecodeError::from((s, e)))?;
+        header.file.crc32 = crc32;
+        header.part.crc32 = crc32;
+        Ok(header)
     }
 }
 
@@ -356,8 +282,8 @@ where
 
             if expected_size != actual_size {
                 return Err(DecodeError::IncompleteData {
-                    expected_size,
-                    actual_size,
+                    expected_size: expected_size,
+                    actual_size: actual_size,
                 });
             }
 
@@ -371,14 +297,15 @@ where
         } else {
             let decoded = decode_buffer(&line_buf)?;
             checksum.update(&decoded);
-            actual_size += decoded.len();
+            let decoded_len: u64 = decoded.len().try_into().unwrap();
+            actual_size += decoded_len;
             output.write_all(&decoded)?;
         }
     }
 
     if header.file.parts > 1 {
         Err(DecodeError::IncompleteData {
-            expected_size: 1 + header.part.end - header.part.begin,
+            expected_size: (1 + header.part.end - header.part.begin),
             actual_size,
         })
     } else {
@@ -428,332 +355,171 @@ pub fn decode_buffer(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(output)
 }
 
-fn parse_keywords<'a>(line_buf: &'a [u8]) -> Result<Keywords<'a>, DecodeError> {
-    #[derive(Debug)]
-    enum State {
-        Keyword,
-        Value,
-        End,
-    }
-
-    if !is_header_line(line_buf) {
-        return Err(DecodeError::InvalidHeader {
-            line: buf_to_string(line_buf),
-            position: 0,
-        });
-    }
-
-    let offset = match line_buf.iter().position(|&c| c == b' ') {
-        Some(pos) => pos + 1,
-        None => {
-            return Err(DecodeError::InvalidHeader {
-                line: buf_to_string(line_buf),
-                position: 9,
-            })
-        }
-    };
-
-    let line_kind = &line_buf[..offset - 1];
-
-    let mut values: Keywords<'_> = Keywords::default();
-    let mut state = State::Keyword;
-
-    let mut keyword: &[u8] = &[];
-    let mut keyword_start_idx: Option<usize> = None;
-    let mut value: &[u8] = &[];
-    let mut value_start_idx: Option<usize> = None;
-
-    for (i, &c) in line_buf[offset..].iter().enumerate() {
-        let position = i + offset;
-        match state {
-            State::End => unreachable!(),
-            State::Keyword => match c {
-                b'a'..=b'z' | b'0'..=b'9' => {
-                    if keyword_start_idx.is_none() {
-                        keyword_start_idx = Some(position);
-                    }
-                    keyword = match keyword_start_idx {
-                        Some(idx) => &line_buf[idx..=position],
-                        None => {
-                            return Err(DecodeError::InvalidHeader {
-                                line: buf_to_string(line_buf),
-                                position,
-                            })
-                        }
-                    };
-                }
-                b'=' => {
-                    if keyword.is_empty() || !is_known_keyword(line_kind, keyword) {
-                        return Err(DecodeError::InvalidHeader {
-                            line: buf_to_string(line_buf),
-                            position,
-                        });
-                    } else {
-                        state = State::Value;
-                    }
-                }
-                CR | LF => {}
-                _ => {
-                    return Err(DecodeError::InvalidHeader {
-                        line: buf_to_string(line_buf),
-                        position,
-                    });
-                }
-            },
-            State::Value => match c {
-                CR => {}
-                LF | SPACE if is_end_character(keyword, c) => {
-                    state = match c {
-                        LF => State::End,
-                        SPACE => State::Keyword,
-                        _ => unreachable!(),
-                    };
-                    if let Some(value_start) = value_start_idx {
-                        if let Some(keyword_start) = keyword_start_idx {
-                            match keyword {
-                                b"name" => {
-                                    values.name = Some(Keyword {
-                                        keyword_start,
-                                        value_start,
-                                        value: buf_to_string(value),
-                                        line_buf,
-                                    })
-                                }
-                                b"size" | b"begin" | b"end" => {
-                                    let parsed_value = std::str::from_utf8(value)
-                                        .ok()
-                                        .and_then(|s| s.parse::<usize>().ok())
-                                        .ok_or_else(|| DecodeError::InvalidHeader {
-                                            line: buf_to_string(line_buf),
-                                            position,
-                                        })
-                                        .map(|value| Keyword {
-                                            keyword_start,
-                                            value_start,
-                                            value,
-                                            line_buf,
-                                        })?;
-
-                                    match keyword {
-                                        b"size" => {
-                                            values.size = Some(parsed_value);
-                                        }
-                                        b"begin" => {
-                                            values.begin = Some(parsed_value);
-                                        }
-                                        b"end" => {
-                                            values.end = Some(parsed_value);
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                                b"crc32" | b"pcrc32" => {
-                                    let parsed_value = std::str::from_utf8(value)
-                                        .ok()
-                                        .and_then(|s| u32::from_str_radix(s, 16).ok())
-                                        .ok_or_else(|| DecodeError::InvalidHeader {
-                                            line: buf_to_string(line_buf),
-                                            position,
-                                        })
-                                        .map(|value| Keyword {
-                                            keyword_start,
-                                            value_start,
-                                            value,
-                                            line_buf,
-                                        })?;
-
-                                    match keyword {
-                                        b"crc32" => {
-                                            values.crc32 = Some(parsed_value);
-                                        }
-                                        b"pcrc32" => {
-                                            values.pcrc32 = Some(parsed_value);
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                                b"part" | b"total" => {
-                                    let parsed_value = std::str::from_utf8(value)
-                                        .ok()
-                                        .and_then(|s| s.parse::<u32>().ok())
-                                        .ok_or_else(|| DecodeError::InvalidHeader {
-                                            line: buf_to_string(line_buf),
-                                            position,
-                                        })
-                                        .map(|value| Keyword {
-                                            keyword_start,
-                                            value_start,
-                                            value,
-                                            line_buf,
-                                        })?;
-
-                                    match keyword {
-                                        b"part" => {
-                                            values.part = Some(parsed_value);
-                                        }
-                                        b"total" => {
-                                            values.total = Some(parsed_value);
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                                b"line" => {
-                                    let parsed_value = std::str::from_utf8(value)
-                                        .ok()
-                                        .and_then(|s| s.parse::<u16>().ok())
-                                        .ok_or_else(|| DecodeError::InvalidHeader {
-                                            line: buf_to_string(line_buf),
-                                            position,
-                                        })
-                                        .map(|value| Keyword {
-                                            keyword_start,
-                                            value_start,
-                                            value,
-                                            line_buf,
-                                        })?;
-
-                                    values.line_length = Some(parsed_value);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
-                    keyword_start_idx = None;
-                    value_start_idx = None;
-                }
-                c if is_valid_character(keyword, c) => {
-                    let idx = *value_start_idx.get_or_insert(position);
-                    value = &line_buf[idx..=position];
-                }
-                _ => {
-                    return Err(DecodeError::InvalidHeader {
-                        line: buf_to_string(line_buf),
-                        position,
-                    })
-                }
-            },
-        };
-    }
-
-    Ok(values)
-}
-
-fn is_end_character(keyword: &[u8], c: u8) -> bool {
-    c == LF || (keyword != b"name" && c == SPACE)
-}
-
-fn is_valid_character(keyword: &[u8], c: u8) -> bool {
-    match keyword {
-        b"name" => true,
-        b"size" | b"line" | b"part" | b"total" | b"begin" | b"end" => matches!(c, b'0'..=b'9'),
-        b"crc32" | b"pcrc32" => matches!(c, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f'),
-        _ => false,
-    }
-}
-
-#[derive(Debug)]
-struct Keywords<'a> {
-    name: Option<Keyword<'a, String>>,
-    size: Option<Keyword<'a, usize>>,
-    line_length: Option<Keyword<'a, u16>>,
-    begin: Option<Keyword<'a, usize>>,
-    end: Option<Keyword<'a, usize>>,
-    pcrc32: Option<Keyword<'a, u32>>,
-    crc32: Option<Keyword<'a, u32>>,
-    part: Option<Keyword<'a, u32>>,
-    total: Option<Keyword<'a, u32>>,
+fn parse_ybegin<'a, E>(s: &'a str) -> IResult<&'a str, BeginTokens<'a>, E>
+where
+    E: nom::error::ParseError<&'a str>,
+{
+    map(
+        preceded(
+            tag("=ybegin "),
+            permutation((
+                parse_keyword("line", u16),
+                parse_keyword("size", u64),
+                map(
+                    opt(permutation((
+                        parse_keyword("part", u32),
+                        opt(parse_keyword("total", u32)),
+                    ))),
+                    |part_tokens| part_tokens.map(|(part, total)| BeginPartTokens { part, total }),
+                ),
+                parse_keyword("name", |s: &'a str| -> IResult<&'a str, &'a str, E> {
+                    let (s, value) = take_until("\n")(s)?;
+                    Ok((s, value))
+                }),
+            )),
+        ),
+        |(line, size, part_tokens, name)| BeginTokens {
+            line,
+            size,
+            part_tokens,
+            name,
+        },
+    )(s)
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Keyword<'a, T> {
-    keyword_start: usize,
-    value_start: usize,
-    value: T,
-    line_buf: &'a [u8],
+struct BeginTokens<'a> {
+    line: u16,
+    size: u64,
+    part_tokens: Option<BeginPartTokens>,
+    name: &'a str,
 }
 
-impl<T> Keyword<'_, T> {
-    fn value(self) -> T {
-        self.value
+#[derive(Debug, PartialEq, Eq)]
+struct BeginPartTokens {
+    part: u32,
+    total: Option<u32>,
+}
+
+fn parse_ypart<'a, E>(s: &'a str) -> IResult<&'a str, (u64, u64), E>
+where
+    E: nom::error::ParseError<&'a str>,
+{
+    preceded(
+        tag("=ypart "),
+        permutation((parse_keyword("begin", u64), parse_keyword("end", u64))),
+    )(s)
+}
+
+fn parse_multipart_yend<'a, E>(
+    size: u64,
+    part: u32,
+    total: Option<u32>,
+) -> impl Fn(&'a str) -> IResult<&'a str, (u32, Option<u32>), E>
+where
+    E: nom::error::ParseError<&'a str>,
+{
+    move |s: &'a str| {
+        map(
+            preceded(
+                tag("=yend "),
+                permutation((
+                    parse_keyword("part", tag(part.to_string().as_str())),
+                    opt(parse_keyword(
+                        "total",
+                        tag(total.unwrap_or_default().to_string().as_str()),
+                    )),
+                    parse_keyword("pcrc32", |s: &'a str| -> IResult<&'a str, u32, E> {
+                        let (s, hex) = take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
+                        Ok((s, u32::from_str_radix(hex, 16).unwrap()))
+                    }),
+                    parse_keyword("size", tag(size.to_string().as_str())),
+                    opt(parse_keyword(
+                        "crc32",
+                        |s: &'a str| -> IResult<&'a str, u32, E> {
+                            let (s, hex) =
+                                take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
+                            Ok((s, u32::from_str_radix(hex, 16).unwrap()))
+                        },
+                    )),
+                )),
+            ),
+            |(_, _, pcrc32, _, crc32)| (pcrc32, crc32),
+        )(s)
     }
-
-    fn unexpected(&self) -> DecodeError {
-        DecodeError::InvalidHeader {
-            line: buf_to_string(self.line_buf),
-            position: self.keyword_start,
-        }
-    }
-
-    fn should_equal(&self, expected_value: T) -> Result<T, DecodeError>
-    where
-        T: PartialEq,
-    {
-        if self.value != expected_value {
-            self.unexpected_value()
-        } else {
-            Ok(expected_value)
-        }
-    }
-
-    fn unexpected_value(&self) -> Result<T, DecodeError> {
-        Err(DecodeError::InvalidHeader {
-            line: buf_to_string(self.line_buf),
-            position: self.value_start,
-        })
-    }
 }
 
-impl<'a> Default for Keywords<'a> {
-    fn default() -> Self {
-        Self {
-            name: Default::default(),
-            size: Default::default(),
-            line_length: Default::default(),
-            begin: Default::default(),
-            end: Default::default(),
-            pcrc32: Default::default(),
-            crc32: Default::default(),
-            part: Default::default(),
-            total: Default::default(),
-        }
+fn parse_singlepart_yend<'a, E>(size: u64) -> impl Fn(&'a str) -> IResult<&'a str, Option<u32>, E>
+where
+    E: nom::error::ParseError<&'a str>,
+{
+    move |s: &'a str| {
+        map(
+            preceded(
+                tag("=yend "),
+                permutation((
+                    parse_keyword("size", tag(size.to_string().as_str())),
+                    opt(parse_keyword(
+                        "crc32",
+                        |s: &'a str| -> IResult<&'a str, u32, E> {
+                            let (s, hex) =
+                                take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
+                            Ok((s, u32::from_str_radix(hex, 16).unwrap()))
+                        },
+                    )),
+                )),
+            ),
+            |(_, crc32)| crc32,
+        )(s)
     }
 }
 
-fn is_header_line(line_buf: &[u8]) -> bool {
-    line_buf.starts_with(b"=ybegin ")
-        || line_buf.starts_with(b"=yend ")
-        || line_buf.starts_with(b"=ypart ")
+fn parse_keyword<'a, P, O, E>(
+    keyword: &'static str,
+    mut value_parser: P,
+) -> impl FnMut(&'a str) -> IResult<&'a str, O, E>
+where
+    E: nom::error::ParseError<&'a str>,
+    P: Parser<&'a str, O, E>,
+{
+    move |s: &'a str| {
+        let (s, value) = preceded(
+            tag(keyword),
+            preceded(tag("="), |s: &'a str| value_parser.parse(s)),
+        )(s)?;
+        // separated_pair(tag(keyword), tag("="), |s: &'a str| value_parser.parse(s))(s)?;
+        let (s, _) = cond(keyword == "name", line_ending)(s)?;
+        let (s, _) = cond(keyword != "name", alt((multispace1, eof)))(s)?;
+
+        Ok((s, value))
+    }
 }
 
-fn buf_to_string(line_buf: &[u8]) -> String {
-    String::from_utf8_lossy(line_buf).to_string()
-}
+// #[derive(Debug, PartialEq, Eq)]
+// struct Token<'a, V> {
+//     position: &'a str,
+//     keyword: &'a str,
+//     value: V,
+// }
 
-fn is_known_keyword(line_kind: &[u8], keyword_slice: &[u8]) -> bool {
-    line_kind == b"=ybegin"
-        && matches!(
-            keyword_slice,
-            b"line" | b"name" | b"part" | b"size" | b"total"
-        )
-        || line_kind == b"=ypart" && matches!(keyword_slice, b"begin" | b"end")
-        || line_kind == b"=yend"
-            && matches!(
-                keyword_slice,
-                b"crc32" | b"part" | b"pcrc32" | b"size" | b"total"
-            )
-}
+// type &'a str = LocatedSpan<&'a str>;
 
 #[cfg(test)]
 #[allow(clippy::unreadable_literal)]
 mod tests {
     use std::io::BufReader;
 
+    use nom::{error::VerboseError, IResult};
+
     use crate::{
-        decode::{FileMetaData, Keyword, PartMetaData},
+        decode::{
+            parse_multipart_yend, parse_ybegin, BeginPartTokens, BeginTokens, FileMetaData,
+            PartMetaData,
+        },
         MetaData,
     };
 
-    use super::{decode_buffer, parse_keywords, read_footer, read_header};
+    use super::{decode_buffer, read_footer, read_header};
 
     #[test]
     fn read_valid_single_part_footer() {
@@ -891,7 +657,7 @@ mod tests {
             b"=ybegin size=26624 line=128 part=1 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=0 end=1024\n",
         ));
         let read_result = read_header(&mut rdr);
-        assert!(read_result.is_err());
+        assert!(read_result.is_ok());
     }
 
     #[test]
@@ -927,6 +693,9 @@ mod tests {
             b"=ybegin size=26624 line=128 part=1 total=27 name=CatOnKeyboardInSpace001.jpg\n=ypart begin=1 end=1024\n",
         ));
         let read_result = read_header(&mut rdr);
+        if let Err(ref e) = read_result {
+            println!("{e:?}");
+        }
         assert!(read_result.is_ok());
         let header = read_result.unwrap();
         assert_eq!(
@@ -950,216 +719,148 @@ mod tests {
 
     #[test]
     fn parse_valid_footer_end_nl() {
-        let parse_result = parse_keywords(b"=yend size=26624 part=1 pcrc32=ae052b48\n");
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_multipart_yend(26624, 1, None)("=yend size=26624 part=1 pcrc32=ae052b48\n");
+        println!("{:?}", parse_result);
         assert!(parse_result.is_ok());
-        let metadata = parse_result.unwrap();
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 17,
-                value_start: 22,
-                value: 1,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48\n"
-            }),
-            metadata.part
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 6,
-                value_start: 11,
-                value: 26624,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48\n"
-            }),
-            metadata.size
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 24,
-                value_start: 31,
-                value: 0xae05_2b48,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48\n"
-            }),
-            metadata.pcrc32
-        );
-        assert!(metadata.crc32.is_none());
+
+        let (s, (pcrc32, crc32)) = parse_result.unwrap();
+
+        assert!(s.is_empty());
+        assert!(crc32.is_none());
+
+        assert_eq!(pcrc32, 0xae052b48);
     }
 
     #[test]
     fn parse_valid_footer_end_crlf() {
-        let parse_result =
-            parse_keywords(b"=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n");
+        let parse_result: IResult<_, _, VerboseError<_>> = parse_multipart_yend(26624, 1, None)(
+            "=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n",
+        );
         assert!(parse_result.is_ok());
-        let metadata = parse_result.unwrap();
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 17,
-                value_start: 22,
-                value: 1,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n"
-            }),
-            metadata.part
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 6,
-                value_start: 11,
-                value: 26624,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n"
-            }),
-            metadata.size
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 24,
-                value_start: 31,
-                value: 0xae05_2b48,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n"
-            }),
-            metadata.pcrc32
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 40,
-                value_start: 46,
-                value: 0xff00_ff00,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n"
-            }),
-            metadata.crc32
-        );
+
+        let (s, (pcrc32, crc32)) = parse_result.unwrap();
+
+        assert!(s.is_empty());
+        assert!(crc32.is_some());
+
+        assert_eq!(pcrc32, 0xae052b48);
+        assert_eq!(crc32.unwrap(), 0xff00ff00);
     }
 
-    #[test]
-    fn parse_valid_footer_end_space() {
-        let parse_result = parse_keywords(b"=yend size=26624 part=1 pcrc32=ae052b48 \n");
-        assert!(parse_result.is_ok());
-        let metadata = parse_result.unwrap();
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 17,
-                value_start: 22,
-                value: 1,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 \n"
-            }),
-            metadata.part
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 6,
-                value_start: 11,
-                value: 26624,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 \n"
-            }),
-            metadata.size
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 24,
-                value_start: 31,
-                value: 0xae05_2b48,
-                line_buf: b"=yend size=26624 part=1 pcrc32=ae052b48 \n"
-            }),
-            metadata.pcrc32
-        );
-    }
+    // #[test]
+    // fn parse_valid_footer_end_space() {
+    //     let parse_result: IResult<_, _, VerboseError<_>> =
+    //         parse_yend(Span::new("=yend size=26624 part=1 pcrc32=ae052b48 \n"));
+    //     assert!(parse_result.is_ok());
+
+    //     let (
+    //         s,
+    //         EndTokens {
+    //             size,
+    //             part_tokens,
+    //             crc32,
+    //         },
+    //     ) = parse_result.unwrap();
+
+    //     assert!(s.is_empty());
+    //     assert_token(size, "size", 26624, 6, 1, "size=26624");
+    //     assert!(crc32.is_none());
+
+    //     assert!(part_tokens.is_some());
+    //     let EndPartTokens {
+    //         pcrc32,
+    //         part,
+    //         total,
+    //     } = part_tokens.unwrap();
+
+    //     assert_token(part, "part", 1, 17, 1, &"part=1");
+    //     assert_token(pcrc32, "pcrc32", 0xae052b48, 24, 1, "pcrc32=ae052b48");
+    //     assert!(total.is_none());
+    // }
 
     #[test]
     fn parse_valid_header_begin() {
-        let parse_result = parse_keywords(
-            b"=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n",
-        );
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ybegin("=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n");
         assert!(parse_result.is_ok());
-        let metadata = parse_result.unwrap();
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 8,
-                value_start: 13,
-                value: 1,
-                line_buf: b"=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n"
-            }),
-            metadata.part
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 24,
-                value_start: 29,
-                value: 189_463,
-                line_buf: b"=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n"
-            }),
-            metadata.size
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 15,
-                value_start: 20,
-                value: 128,
-                line_buf: b"=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n"
-            }),
-            metadata.line_length
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 36,
-                value_start: 41,
-                value: "CatOnKeyboardInSpace001.jpg".to_string(),
-                line_buf: b"=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n"
-            }),
-            metadata.name
-        );
+
+        let (
+            s,
+            BeginTokens {
+                line,
+                size,
+                part_tokens,
+                name,
+            },
+        ) = parse_result.unwrap();
+
+        assert!(s.is_empty());
+        assert_eq!(line, 128);
+        assert_eq!(size, 189463);
+        assert_eq!(name, "CatOnKeyboardInSpace001.jpg");
+
+        assert!(part_tokens.is_some());
+        let BeginPartTokens { part, total } = part_tokens.unwrap();
+
+        assert_eq!(part, 1);
+        assert!(total.is_none());
     }
 
-    #[test]
-    fn parse_valid_header_part() {
-        let parse_result = parse_keywords(b"=ypart begin=1 end=189463\n");
-        assert!(parse_result.is_ok());
-        let metadata = parse_result.unwrap();
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 7,
-                value_start: 13,
-                value: 1,
-                line_buf: b"=ypart begin=1 end=189463\n"
-            }),
-            metadata.begin
-        );
-        assert_eq!(
-            Some(Keyword {
-                keyword_start: 15,
-                value_start: 19,
-                value: 189_463,
-                line_buf: b"=ypart begin=1 end=189463\n"
-            }),
-            metadata.end
-        );
-    }
+    // #[test]
+    // fn parse_valid_header_part() {
+    //     let parse_result = parse_keywords(b"=ypart begin=1 end=189463\n");
+    //     assert!(parse_result.is_ok());
+    //     let metadata = parse_result.unwrap();
+    //     assert_eq!(
+    //         Some(Keyword {
+    //             keyword_start: 7,
+    //             value_start: 13,
+    //             value: 1,
+    //             line_buf: b"=ypart begin=1 end=189463\n"
+    //         }),
+    //         metadata.begin
+    //     );
+    //     assert_eq!(
+    //         Some(Keyword {
+    //             keyword_start: 15,
+    //             value_start: 19,
+    //             value: 189_463,
+    //             line_buf: b"=ypart begin=1 end=189463\n"
+    //         }),
+    //         metadata.end
+    //     );
+    // }
 
-    #[test]
-    fn invalid_header_tag() {
-        let parse_result = parse_keywords(b"=yparts begin=1 end=189463\n");
-        assert!(parse_result.is_err());
-    }
+    // #[test]
+    // fn invalid_header_tag() {
+    //     let parse_result = parse_keywords(b"=yparts begin=1 end=189463\n");
+    //     assert!(parse_result.is_err());
+    // }
 
-    #[test]
-    fn invalid_header_unknown_keyword() {
-        let parse_result = parse_keywords(b"=ybegin parts=1 total=4 name=party.jpg\r\n");
-        assert!(parse_result.is_err());
-    }
+    // #[test]
+    // fn invalid_header_unknown_keyword() {
+    //     let parse_result = parse_keywords(b"=ybegin parts=1 total=4 name=party.jpg\r\n");
+    //     assert!(parse_result.is_err());
+    // }
 
-    #[test]
-    fn invalid_header_invalid_begin() {
-        let parse_result = parse_keywords(b"=ypart begin=a end=189463\n");
-        assert!(parse_result.is_err());
-    }
+    // #[test]
+    // fn invalid_header_invalid_begin() {
+    //     let parse_result = parse_keywords(b"=ypart begin=a end=189463\n");
+    //     assert!(parse_result.is_err());
+    // }
 
-    #[test]
-    fn invalid_header_invalid_end() {
-        let parse_result = parse_keywords(b"=ypart begin=1 end=18_9463\n");
-        assert!(parse_result.is_err());
-    }
+    // #[test]
+    // fn invalid_header_invalid_end() {
+    //     let parse_result = parse_keywords(b"=ypart begin=1 end=18_9463\n");
+    //     assert!(parse_result.is_err());
+    // }
 
-    #[test]
-    fn invalid_header_empty_keyword() {
-        let parse_result = parse_keywords(b"=ypart =1 end=189463\n");
-        assert!(parse_result.is_err());
-    }
+    // #[test]
+    // fn invalid_header_empty_keyword() {
+    //     let parse_result = parse_keywords(b"=ypart =1 end=189463\n");
+    //     assert!(parse_result.is_err());
+    // }
 
     #[test]
     fn decode_invalid() {
