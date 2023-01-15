@@ -495,15 +495,6 @@ where
     }
 }
 
-// #[derive(Debug, PartialEq, Eq)]
-// struct Token<'a, V> {
-//     position: &'a str,
-//     keyword: &'a str,
-//     value: V,
-// }
-
-// type &'a str = LocatedSpan<&'a str>;
-
 #[cfg(test)]
 #[allow(clippy::unreadable_literal)]
 mod tests {
