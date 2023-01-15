@@ -513,8 +513,8 @@ mod tests {
 
     use crate::{
         decode::{
-            parse_multipart_yend, parse_ybegin, BeginPartTokens, BeginTokens, FileMetaData,
-            PartMetaData,
+            parse_multipart_yend, parse_ybegin, parse_ypart, BeginPartTokens, BeginTokens,
+            FileMetaData, PartMetaData,
         },
         MetaData,
     };
@@ -748,36 +748,19 @@ mod tests {
         assert_eq!(crc32.unwrap(), 0xff00ff00);
     }
 
-    // #[test]
-    // fn parse_valid_footer_end_space() {
-    //     let parse_result: IResult<_, _, VerboseError<_>> =
-    //         parse_yend(Span::new("=yend size=26624 part=1 pcrc32=ae052b48 \n"));
-    //     assert!(parse_result.is_ok());
+    #[test]
+    fn parse_valid_footer_end_space() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_multipart_yend(26624, 1, None)("=yend size=26624 part=1 pcrc32=ae052b48 \n");
+        assert!(parse_result.is_ok());
 
-    //     let (
-    //         s,
-    //         EndTokens {
-    //             size,
-    //             part_tokens,
-    //             crc32,
-    //         },
-    //     ) = parse_result.unwrap();
+        let (s, (pcrc32, crc32)) = parse_result.unwrap();
 
-    //     assert!(s.is_empty());
-    //     assert_token(size, "size", 26624, 6, 1, "size=26624");
-    //     assert!(crc32.is_none());
+        assert!(s.is_empty());
+        assert!(crc32.is_none());
 
-    //     assert!(part_tokens.is_some());
-    //     let EndPartTokens {
-    //         pcrc32,
-    //         part,
-    //         total,
-    //     } = part_tokens.unwrap();
-
-    //     assert_token(part, "part", 1, 17, 1, &"part=1");
-    //     assert_token(pcrc32, "pcrc32", 0xae052b48, 24, 1, "pcrc32=ae052b48");
-    //     assert!(total.is_none());
-    // }
+        assert_eq!(pcrc32, 0xae052b48);
+    }
 
     #[test]
     fn parse_valid_header_begin() {
@@ -807,60 +790,49 @@ mod tests {
         assert!(total.is_none());
     }
 
-    // #[test]
-    // fn parse_valid_header_part() {
-    //     let parse_result = parse_keywords(b"=ypart begin=1 end=189463\n");
-    //     assert!(parse_result.is_ok());
-    //     let metadata = parse_result.unwrap();
-    //     assert_eq!(
-    //         Some(Keyword {
-    //             keyword_start: 7,
-    //             value_start: 13,
-    //             value: 1,
-    //             line_buf: b"=ypart begin=1 end=189463\n"
-    //         }),
-    //         metadata.begin
-    //     );
-    //     assert_eq!(
-    //         Some(Keyword {
-    //             keyword_start: 15,
-    //             value_start: 19,
-    //             value: 189_463,
-    //             line_buf: b"=ypart begin=1 end=189463\n"
-    //         }),
-    //         metadata.end
-    //     );
-    // }
+    #[test]
+    fn parse_valid_header_part() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ypart("=ypart begin=1 end=189463\n");
+        assert!(parse_result.is_ok());
+        let (_, (begin, end)) = parse_result.unwrap();
+        assert_eq!(1, begin);
+        assert_eq!(189463, end);
+    }
 
-    // #[test]
-    // fn invalid_header_tag() {
-    //     let parse_result = parse_keywords(b"=yparts begin=1 end=189463\n");
-    //     assert!(parse_result.is_err());
-    // }
+    #[test]
+    fn invalid_header_tag() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ybegin("=yparts begin=1 end=189463\n");
+        assert!(parse_result.is_err());
+    }
 
-    // #[test]
-    // fn invalid_header_unknown_keyword() {
-    //     let parse_result = parse_keywords(b"=ybegin parts=1 total=4 name=party.jpg\r\n");
-    //     assert!(parse_result.is_err());
-    // }
+    #[test]
+    fn invalid_header_unknown_keyword() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ybegin("=ybegin parts=1 total=4 name=party.jpg\r\n");
+        assert!(parse_result.is_err());
+    }
 
-    // #[test]
-    // fn invalid_header_invalid_begin() {
-    //     let parse_result = parse_keywords(b"=ypart begin=a end=189463\n");
-    //     assert!(parse_result.is_err());
-    // }
+    #[test]
+    fn invalid_header_invalid_begin() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ypart("=ypart begin=a end=189463\n");
+        assert!(parse_result.is_err());
+    }
 
-    // #[test]
-    // fn invalid_header_invalid_end() {
-    //     let parse_result = parse_keywords(b"=ypart begin=1 end=18_9463\n");
-    //     assert!(parse_result.is_err());
-    // }
+    #[test]
+    fn invalid_header_invalid_end() {
+        let parse_result: IResult<_, _, VerboseError<_>> =
+            parse_ypart("=ypart begin=1 end=18_9463\n");
+        assert!(parse_result.is_err());
+    }
 
-    // #[test]
-    // fn invalid_header_empty_keyword() {
-    //     let parse_result = parse_keywords(b"=ypart =1 end=189463\n");
-    //     assert!(parse_result.is_err());
-    // }
+    #[test]
+    fn invalid_header_empty_keyword() {
+        let parse_result: IResult<_, _, VerboseError<_>> = parse_ypart("=ypart =1 end=189463\n");
+        assert!(parse_result.is_err());
+    }
 
     #[test]
     fn decode_invalid() {
