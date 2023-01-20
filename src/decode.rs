@@ -110,36 +110,38 @@ where
     read_remaining(header, &mut rdr, output)
 }
 
-/// Metadata of the message.
+/// Metadata describing the message.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MetaData {
-    /// Metadata describing the original file.
+    /// Description of the unencoded binary.
     file: FileMetaData,
-    /// Metadata describing the decoded block.
+    /// Description of an encoded part of the binary.
     part: PartMetaData,
 }
 
+/// Metadata describing a file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FileMetaData {
-    /// The name of the original binary file.
+    /// The name of the file.
     name: String,
-    /// The size of the original unencoded binary.
+    /// The size of the file.
     size: u64,
-    /// The CRC32 checksum of the entire encoded binary.
+    /// The CRC32 checksum of the file.
     crc32: Option<u32>,
-    /// The total amount of parts.
+    /// The number of blocks the file is split into.
     parts: u32,
 }
 
+/// Metadata describing an encoded part of a file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PartMetaData {
-    /// The part number of the part.
+    /// The sequential part number.
     part_number: u32,
     /// The starting point of the block in the original unencoded binary.
     begin: u64,
     /// The ending point of the block in the original unencoded binary.
     end: u64,
-    /// The CRC32 checksum of the encoded part.
+    /// The CRC32 checksum of this part.
     crc32: Option<u32>,
 }
 
