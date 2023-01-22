@@ -35,6 +35,7 @@ mod constants;
 mod decode;
 mod encode;
 mod errors;
+mod parsers;
 
 pub use self::decode::{decode_buffer, DecodeOptions, MetaData};
 pub use self::encode::{encode_buffer, EncodeOptions};

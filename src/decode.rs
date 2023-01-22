@@ -1,18 +1,14 @@
 use fs_err::OpenOptions;
-use nom::branch::{alt, permutation};
-use nom::bytes::complete::{tag, take_until, take_while_m_n};
-use nom::character::complete::{line_ending, multispace1, u16, u32, u64};
-use nom::combinator::{cond, eof, map, opt};
-use nom::error::VerboseError;
-use nom::sequence::preceded;
-use nom::{IResult, Parser};
 use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use std::path::Path;
 
+use crate::parsers::{multipart_yend, singlepart_yend, ypart};
+
 use super::constants::{CR, DEFAULT_LINE_SIZE, DOT, ESCAPE, LF, NUL};
 use super::errors::DecodeError;
+use super::parsers::ybegin;
 
 /// Options for decoding.
 /// The entry point for decoding from a file or (TCP) stream to an output directory.
@@ -162,20 +158,20 @@ where
 
     let s: &str = &String::from_utf8_lossy(&line_buf[..]);
 
-    let BeginTokens {
+    let BeginInfo {
         line: _,
         size,
         part_tokens,
         name,
-    } = use_parser(ybegin_parser)(s)?;
+    } = use_parser(ybegin)(s)?;
 
-    if let Some(BeginPartTokens { part, total }) = part_tokens {
+    if let Some(PartInfo { part, total }) = part_tokens {
         let mut line_buf = Vec::<u8>::with_capacity(2 * DEFAULT_LINE_SIZE as usize);
         rdr.read_until(LF, &mut line_buf)?;
 
         let s: &str = &String::from_utf8_lossy(&line_buf[..]);
 
-        let (begin, end) = use_parser(ypart_parser)(s)?;
+        let (begin, end) = use_parser(ypart)(s)?;
         Ok(MetaData {
             file: FileMetaData {
                 name: name.to_string(),
@@ -231,7 +227,7 @@ fn read_footer(mut header: MetaData, line_buf: &[u8]) -> Result<MetaData, Decode
         let expected_part = header.part.part_number;
         let expected_part_count = header.file.parts;
 
-        let (pcrc32, crc32) = use_parser(multipart_yend_parser(
+        let (pcrc32, crc32) = use_parser(multipart_yend(
             expected_size,
             expected_part,
             Some(expected_part_count),
@@ -242,7 +238,7 @@ fn read_footer(mut header: MetaData, line_buf: &[u8]) -> Result<MetaData, Decode
 
         Ok(header)
     } else {
-        let crc32 = use_parser(singlepart_yend_parser(header.file.size))(&s)?;
+        let crc32 = use_parser(singlepart_yend(header.file.size))(&s)?;
 
         header.file.crc32 = crc32;
         header.part.crc32 = crc32;
@@ -360,7 +356,7 @@ pub fn decode_buffer(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 fn use_parser<'a, O, F>(mut parser: F) -> impl FnMut(&'a str) -> Result<O, DecodeError>
 where
-    F: Parser<&'a str, O, VerboseError<&'a str>>,
+    F: nom::Parser<&'a str, O, nom::error::VerboseError<&'a str>>,
 {
     move |input: &'a str| {
         parser
@@ -370,144 +366,18 @@ where
     }
 }
 
-fn ybegin_parser<'a, E>(s: &'a str) -> IResult<&'a str, BeginTokens<'a>, E>
-where
-    E: nom::error::ParseError<&'a str>,
-{
-    map(
-        preceded(
-            tag("=ybegin "),
-            permutation((
-                parse_keyword("line", u16),
-                parse_keyword("size", u64),
-                map(
-                    opt(permutation((
-                        parse_keyword("part", u32),
-                        opt(parse_keyword("total", u32)),
-                    ))),
-                    |part_tokens| part_tokens.map(|(part, total)| BeginPartTokens { part, total }),
-                ),
-                parse_keyword("name", |s: &'a str| -> IResult<&'a str, &'a str, E> {
-                    let (s, value) = take_until("\n")(s)?;
-                    Ok((s, value))
-                }),
-            )),
-        ),
-        |(line, size, part_tokens, name)| BeginTokens {
-            line,
-            size,
-            part_tokens,
-            name,
-        },
-    )(s)
+#[derive(Debug, PartialEq, Eq)]
+pub struct BeginInfo<'a> {
+    pub line: u16,
+    pub size: u64,
+    pub part_tokens: Option<PartInfo>,
+    pub name: &'a str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct BeginTokens<'a> {
-    line: u16,
-    size: u64,
-    part_tokens: Option<BeginPartTokens>,
-    name: &'a str,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct BeginPartTokens {
-    part: u32,
-    total: Option<u32>,
-}
-
-fn ypart_parser<'a, E>(s: &'a str) -> IResult<&'a str, (u64, u64), E>
-where
-    E: nom::error::ParseError<&'a str>,
-{
-    preceded(
-        tag("=ypart "),
-        permutation((parse_keyword("begin", u64), parse_keyword("end", u64))),
-    )(s)
-}
-
-fn multipart_yend_parser<'a, E>(
-    size: u64,
-    part: u32,
-    total: Option<u32>,
-) -> impl Fn(&'a str) -> IResult<&'a str, (u32, Option<u32>), E>
-where
-    E: nom::error::ParseError<&'a str>,
-{
-    move |s: &'a str| {
-        map(
-            preceded(
-                tag("=yend "),
-                permutation((
-                    parse_keyword("part", tag(part.to_string().as_str())),
-                    opt(parse_keyword(
-                        "total",
-                        tag(total.unwrap_or_default().to_string().as_str()),
-                    )),
-                    parse_keyword("pcrc32", |s: &'a str| -> IResult<&'a str, u32, E> {
-                        let (s, hex) = take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
-                        Ok((s, u32::from_str_radix(hex, 16).unwrap()))
-                    }),
-                    parse_keyword("size", tag(size.to_string().as_str())),
-                    opt(parse_keyword(
-                        "crc32",
-                        |s: &'a str| -> IResult<&'a str, u32, E> {
-                            let (s, hex) =
-                                take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
-                            Ok((s, u32::from_str_radix(hex, 16).unwrap()))
-                        },
-                    )),
-                )),
-            ),
-            |(_, _, pcrc32, _, crc32)| (pcrc32, crc32),
-        )(s)
-    }
-}
-
-fn singlepart_yend_parser<'a, E>(size: u64) -> impl Fn(&'a str) -> IResult<&'a str, Option<u32>, E>
-where
-    E: nom::error::ParseError<&'a str>,
-{
-    move |s: &'a str| {
-        map(
-            preceded(
-                tag("=yend "),
-                permutation((
-                    parse_keyword("size", tag(size.to_string().as_str())),
-                    opt(parse_keyword(
-                        "crc32",
-                        |s: &'a str| -> IResult<&'a str, u32, E> {
-                            let (s, hex) =
-                                take_while_m_n(1, 8, |c: char| c.is_ascii_hexdigit())(s)?;
-                            Ok((s, u32::from_str_radix(hex, 16).unwrap()))
-                        },
-                    )),
-                )),
-            ),
-            |(_, crc32)| crc32,
-        )(s)
-    }
-}
-
-fn parse_keyword<'a, P, O, E>(
-    keyword: &'static str,
-    mut value_parser: P,
-) -> impl FnMut(&'a str) -> IResult<&'a str, O, E>
-where
-    E: nom::error::ParseError<&'a str>,
-    P: Parser<&'a str, O, E>,
-{
-    move |s: &'a str| {
-        let (s, value) = preceded(
-            tag(keyword),
-            preceded(tag("="), |s: &'a str| value_parser.parse(s)),
-        )(s)?;
-
-        let (s, _) = cond(keyword == "name", line_ending)(s)?;
-        let (s, _) = cond(keyword != "name", alt((multispace1, eof)))(s)?;
-
-        Ok((s, value))
-    }
+pub struct PartInfo {
+    pub part: u32,
+    pub total: Option<u32>,
 }
 
 #[cfg(test)]
@@ -515,13 +385,8 @@ where
 mod tests {
     use std::io::BufReader;
 
-    use nom::{error::VerboseError, IResult};
-
     use crate::{
-        decode::{
-            multipart_yend_parser, ybegin_parser, ypart_parser, BeginPartTokens, BeginTokens,
-            FileMetaData, PartMetaData,
-        },
+        decode::{FileMetaData, PartMetaData},
         MetaData,
     };
 
@@ -721,123 +586,6 @@ mod tests {
             },
             header
         );
-    }
-
-    #[test]
-    fn parse_valid_footer_end_nl() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            multipart_yend_parser(26624, 1, None)("=yend size=26624 part=1 pcrc32=ae052b48\n");
-        println!("{:?}", parse_result);
-        assert!(parse_result.is_ok());
-
-        let (s, (pcrc32, crc32)) = parse_result.unwrap();
-
-        assert!(s.is_empty());
-        assert!(crc32.is_none());
-
-        assert_eq!(pcrc32, 0xae052b48);
-    }
-
-    #[test]
-    fn parse_valid_footer_end_crlf() {
-        let parse_result: IResult<_, _, VerboseError<_>> = multipart_yend_parser(26624, 1, None)(
-            "=yend size=26624 part=1 pcrc32=ae052b48 crc32=ff00ff00\r\n",
-        );
-        assert!(parse_result.is_ok());
-
-        let (s, (pcrc32, crc32)) = parse_result.unwrap();
-
-        assert!(s.is_empty());
-        assert!(crc32.is_some());
-
-        assert_eq!(pcrc32, 0xae052b48);
-        assert_eq!(crc32.unwrap(), 0xff00ff00);
-    }
-
-    #[test]
-    fn parse_valid_footer_end_space() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            multipart_yend_parser(26624, 1, None)("=yend size=26624 part=1 pcrc32=ae052b48 \n");
-        assert!(parse_result.is_ok());
-
-        let (s, (pcrc32, crc32)) = parse_result.unwrap();
-
-        assert!(s.is_empty());
-        assert!(crc32.is_none());
-
-        assert_eq!(pcrc32, 0xae052b48);
-    }
-
-    #[test]
-    fn parse_valid_header_begin() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ybegin_parser("=ybegin part=1 line=128 size=189463 name=CatOnKeyboardInSpace001.jpg\n");
-        assert!(parse_result.is_ok());
-
-        let (
-            s,
-            BeginTokens {
-                line,
-                size,
-                part_tokens,
-                name,
-            },
-        ) = parse_result.unwrap();
-
-        assert!(s.is_empty());
-        assert_eq!(line, 128);
-        assert_eq!(size, 189463);
-        assert_eq!(name, "CatOnKeyboardInSpace001.jpg");
-
-        assert!(part_tokens.is_some());
-        let BeginPartTokens { part, total } = part_tokens.unwrap();
-
-        assert_eq!(part, 1);
-        assert!(total.is_none());
-    }
-
-    #[test]
-    fn parse_valid_header_part() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ypart_parser("=ypart begin=1 end=189463\n");
-        assert!(parse_result.is_ok());
-        let (_, (begin, end)) = parse_result.unwrap();
-        assert_eq!(1, begin);
-        assert_eq!(189463, end);
-    }
-
-    #[test]
-    fn invalid_header_tag() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ybegin_parser("=yparts begin=1 end=189463\n");
-        assert!(parse_result.is_err());
-    }
-
-    #[test]
-    fn invalid_header_unknown_keyword() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ybegin_parser("=ybegin parts=1 total=4 name=party.jpg\r\n");
-        assert!(parse_result.is_err());
-    }
-
-    #[test]
-    fn invalid_header_invalid_begin() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ypart_parser("=ypart begin=a end=189463\n");
-        assert!(parse_result.is_err());
-    }
-
-    #[test]
-    fn invalid_header_invalid_end() {
-        let parse_result: IResult<_, _, VerboseError<_>> =
-            ypart_parser("=ypart begin=1 end=18_9463\n");
-        assert!(parse_result.is_err());
-    }
-
-    #[test]
-    fn invalid_header_empty_keyword() {
-        let parse_result: IResult<_, _, VerboseError<_>> = ypart_parser("=ypart =1 end=189463\n");
-        assert!(parse_result.is_err());
     }
 
     #[test]
