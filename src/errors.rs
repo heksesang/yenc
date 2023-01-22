@@ -156,4 +156,3 @@ impl fmt::Display for EncodeError {
         }
     }
 }
-// impl error::Error for DecodeError {}
